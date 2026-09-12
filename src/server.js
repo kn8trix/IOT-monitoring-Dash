@@ -34,8 +34,10 @@ const { bus, log } = require('./events');
 /* -------------------------------------------------------------------------- */
 
 db.init();
-db.seedDevices(config.seed.deviceCount);
-db.seedDefaultRules();
+// A fresh database starts empty (0 devices): rows are only ever created by real
+// telemetry arriving over MQTT or POST /api/webhook/data. The sole exception is
+// the baseline automation-rule set, which is configuration rather than data.
+if (config.seed.defaultRules) db.seedDefaultRules();
 automation.start();
 forwarder.start();
 

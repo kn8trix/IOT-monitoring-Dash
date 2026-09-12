@@ -14,34 +14,21 @@
   <body class="min-h-full antialiased">
     <!-- ============================== HEADER ============================== -->
     <header class="sticky top-0 z-30 border-b border-edge bg-void/95 backdrop-blur">
-      <div class="mx-auto flex max-w-[1600px] flex-wrap items-center gap-x-5 gap-y-2 px-3 py-2.5 sm:px-5">
-        <h1 class="neon-title glow-text text-base font-bold tracking-[0.22em] text-neon sm:text-xl">
+      <div class="mx-auto flex max-w-[1600px] flex-wrap items-center gap-x-5 gap-y-2 px-3 py-3 sm:px-5">
+        <h1 class="neon-title glow-text text-lg font-bold tracking-[0.2em] text-neon sm:text-2xl">
           IOT&nbsp;//&nbsp;DASHBOARD
         </h1>
 
         <div class="badge" title="Server + Socket.io link">
           <span id="status-dot" class="dot dot-online"></span>
-          <span class="text-[0.62rem] text-[#8fb39b]">SYSTEM STATUS:</span>
+          <span class="text-sm text-[#8fb39b]">SYSTEM STATUS:</span>
           <span id="status-label" class="text-neon glow-text-soft">ACTIVE</span>
         </div>
 
         <div class="badge" title="MQTT broker connection">
           <span id="mqtt-dot" class="dot dot-offline"></span>
-          <span class="text-[#8fb39b]">MQTT:</span>
+          <span class="text-sm text-[#8fb39b]">MQTT:</span>
           <span id="mqtt-label" class="text-[#6d8b84]">CONNECTING</span>
-        </div>
-
-        <div class="hidden items-center gap-4 lg:flex">
-          <span class="badge" title="Devices online / registered">
-            <span class="text-[#8fb39b]">NODES:</span>
-            <span id="header-online" class="text-neon">0</span>
-            <span class="text-[#47605a]">/</span>
-            <span id="header-total" class="text-[#8fb39b]">0</span>
-          </span>
-          <span class="badge" title="Readings received in the last minute">
-            <span class="text-[#8fb39b]">IN/MIN:</span>
-            <span id="header-rate" class="text-neon">0</span>
-          </span>
         </div>
 
         <div class="ml-auto flex items-center gap-2">
@@ -55,45 +42,29 @@
           <button id="open-logs" class="btn" type="button" title="Open the system log">
             ▚ SYSTEM LOG
           </button>
-          <time id="clock" class="hidden font-mono text-xs text-neon glow-text-soft xl:inline">--:--:--</time>
+          <time id="clock" class="hidden font-mono text-sm text-neon glow-text-soft xl:inline">--:--:--</time>
         </div>
       </div>
     </header>
 
     <main class="mx-auto max-w-[1600px] px-3 pb-10 pt-4 sm:px-5">
-      <!-- ============================ STATS ============================ -->
-      <section class="grid grid-cols-2 gap-2.5 sm:grid-cols-4 xl:grid-cols-8">
+      <!-- ====================== SUMMARY METRICS ======================== -->
+      <section class="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <div class="stat-card">
-          <p class="label mb-0">Devices</p>
-          <p id="stat-total" class="text-xl font-bold text-neon glow-text-soft">0</p>
+          <p class="label mb-0">Total devices</p>
+          <p id="stat-total" class="stat-value">0</p>
         </div>
         <div class="stat-card">
           <p class="label mb-0">Online</p>
-          <p id="stat-online" class="text-xl font-bold text-neon glow-text-soft">0</p>
+          <p id="stat-online" class="stat-value">0</p>
         </div>
         <div class="stat-card">
           <p class="label mb-0">Offline</p>
-          <p id="stat-offline" class="text-xl font-bold text-[#6d8b84]">0</p>
+          <p id="stat-offline" class="stat-value stat-value-dim">0</p>
         </div>
         <div class="stat-card">
-          <p class="label mb-0">Readings / min</p>
-          <p id="stat-rate" class="text-xl font-bold text-neon glow-text-soft">0</p>
-        </div>
-        <div class="stat-card">
-          <p class="label mb-0">Configured</p>
-          <p id="stat-configured" class="text-xl font-bold text-[#9fd8b4]">0</p>
-        </div>
-        <div class="stat-card">
-          <p class="label mb-0">Queued cmds</p>
-          <p id="stat-pending" class="text-xl font-bold text-[#eaff6b]">0</p>
-        </div>
-        <div class="stat-card">
-          <p class="label mb-0">Forwarded / 24h</p>
-          <p id="stat-forwarded" class="text-xl font-bold text-[#22d3ee]">0</p>
-        </div>
-        <div class="stat-card">
-          <p class="label mb-0">Uptime</p>
-          <p id="stat-uptime" class="text-xl font-bold text-[#22d3ee]">0s</p>
+          <p class="label mb-0">Forwarded webhooks</p>
+          <p id="stat-forwarded" class="stat-value stat-value-dim">0</p>
         </div>
       </section>
 
@@ -101,7 +72,7 @@
       <section class="panel mt-4">
         <div class="sticky-bar panel-header rounded-t-xl px-3.5 py-2.5">
           <div class="flex flex-wrap items-center gap-x-3 gap-y-2">
-            <h2 class="glow-text-soft text-xs font-bold tracking-[0.18em] text-neon">DEVICE GRID</h2>
+            <h2 class="glow-text-soft text-base font-bold tracking-[0.16em] text-neon">DEVICE GRID</h2>
             <span id="device-count" class="badge text-[#8fb39b]" aria-live="polite" title="Devices matching the search">
               TOTAL: 0 | ONLINE: 0 | OFFLINE: 0
             </span>
@@ -125,8 +96,8 @@
 
         <div id="device-grid" class="grid grid-cols-1 gap-3.5 p-3.5 md:grid-cols-2 xl:grid-cols-3"></div>
 
-        <div class="flex items-center justify-center gap-3 border-t border-edge px-3.5 py-2.5">
-          <span id="device-grid-note" class="text-[0.66rem] text-[#6d8b84]"></span>
+        <div class="flex items-center justify-center gap-3 border-t border-edge px-3.5 py-3">
+          <span id="device-grid-note" class="text-sm text-[#6d8b84]"></span>
           <button id="device-more" class="btn hidden" type="button">LOAD MORE</button>
         </div>
       </section>
@@ -171,7 +142,7 @@
               <span id="dm-current" class="badge ml-auto border-[rgba(57,255,20,0.45)] text-neon glow-text-soft">--</span>
             </div>
 
-            <div class="mt-2 flex flex-wrap items-center gap-4 text-[0.66rem] text-[#6d8b84]">
+            <div class="mt-2 flex flex-wrap items-center gap-5 text-base text-[#8fb39b]">
               <span>MIN <b id="dm-min" class="text-neon">--</b></span>
               <span>MAX <b id="dm-max" class="text-neon">--</b></span>
               <span>AVG <b id="dm-avg" class="text-neon">--</b></span>
@@ -186,19 +157,19 @@
             <div class="mt-3 grid grid-cols-2 gap-2.5 sm:grid-cols-4">
               <div class="metric-block">
                 <p class="metric-label">Last ping</p>
-                <p class="metric-value text-sm" id="dm-last-ping">—</p>
+                <p class="metric-value text-lg" id="dm-last-ping">—</p>
               </div>
               <div class="metric-block">
                 <p class="metric-label">Location</p>
-                <p class="metric-value text-sm" id="dm-location">—</p>
+                <p class="metric-value text-lg" id="dm-location">—</p>
               </div>
               <div class="metric-block">
                 <p class="metric-label">Firmware</p>
-                <p class="metric-value text-sm" id="dm-firmware">—</p>
+                <p class="metric-value text-lg" id="dm-firmware">—</p>
               </div>
               <div class="metric-block">
                 <p class="metric-label">Config revision</p>
-                <p class="metric-value text-sm" id="dm-config-rev">—</p>
+                <p class="metric-value text-lg" id="dm-config-rev">—</p>
               </div>
             </div>
           </section>
@@ -220,23 +191,23 @@
                 <div class="mb-1 flex items-center justify-between">
                   <label class="label mb-0" for="dm-payload">Custom payload</label>
                   <div class="flex gap-1">
-                    <button class="btn px-2 py-0.5 text-[0.6rem] btn-active" data-dm-mode="json" type="button">JSON</button>
-                    <button class="btn px-2 py-0.5 text-[0.6rem]" data-dm-mode="text" type="button">TEXT</button>
+                    <button class="btn px-2 py-0.5 text-sm btn-active" data-dm-mode="json" type="button">JSON</button>
+                    <button class="btn px-2 py-0.5 text-sm" data-dm-mode="text" type="button">TEXT</button>
                   </div>
                 </div>
-                <textarea id="dm-payload" class="textarea h-[130px] resize-y" spellcheck="false"
+                <textarea id="dm-payload" class="textarea h-[170px] resize-y" spellcheck="false"
                   placeholder='{&#10;  "action": "RELAY_ON",&#10;  "duration_ms": 5000&#10;}'></textarea>
-                <p id="dm-payload-hint" class="mt-1 text-[0.62rem] text-[#47605a]">JSON payloads are validated before sending.</p>
-                <button id="dm-send" class="btn btn-neon mt-2 w-full py-2.5 text-sm tracking-[0.2em]" type="button">
+                <p id="dm-payload-hint" class="mt-1 text-sm text-[#47605a]">JSON payloads are validated before sending.</p>
+                <button id="dm-send" class="btn btn-neon mt-2 w-full py-3 text-base tracking-[0.18em]" type="button">
                   ▶ SEND TO DEVICE
                 </button>
-                <p id="dm-result" class="mt-1.5 min-h-[1rem] text-[0.68rem] text-[#6d8b84]"></p>
+                <p id="dm-result" class="mt-1.5 min-h-[1rem] text-base text-[#6d8b84]"></p>
               </div>
 
               <div>
                 <p class="label">Recent commands</p>
-                <div class="max-h-[230px] overflow-y-auto rounded-lg border border-edge">
-                  <table class="w-full text-left text-[0.64rem]">
+                <div class="max-h-[280px] overflow-y-auto rounded-lg border border-edge">
+                  <table class="w-full text-left text-base">
                     <thead class="sticky top-0 bg-panel text-[#47605a]">
                       <tr><th class="px-2 py-1">#</th><th class="px-2 py-1">PAYLOAD</th><th class="px-2 py-1">STATUS</th></tr>
                     </thead>
@@ -250,7 +221,7 @@
           <!-- ---- c) custom configuration ---- -->
           <section data-tab-panel="config" class="hidden">
             <div class="flex flex-wrap items-center gap-2">
-              <p class="text-[0.66rem] text-[#6d8b84]">
+              <p class="text-sm text-[#6d8b84]">
                 Stored in SQLite and served to the device at boot from
                 <code class="text-neon">GET /api/device/&lt;id&gt;/config</code>.
               </p>
@@ -261,49 +232,49 @@
               <div>
                 <div class="mb-1 flex items-center justify-between">
                   <p class="label mb-0">Form editor</p>
-                  <button id="dm-config-add" class="btn px-2 py-0.5 text-[0.6rem]" type="button">+ ADD FIELD</button>
+                  <button id="dm-config-add" class="btn px-2 py-0.5 text-sm" type="button">+ ADD FIELD</button>
                 </div>
                 <div id="dm-config-form" class="space-y-1.5"></div>
               </div>
 
               <div>
                 <p class="label">Raw JSON</p>
-                <textarea id="dm-config-json" class="textarea h-[240px] resize-y" spellcheck="false"></textarea>
-                <p id="dm-config-error" class="mt-1 min-h-[1rem] text-[0.62rem] text-[#47605a]"></p>
+                <textarea id="dm-config-json" class="textarea h-[300px] resize-y" spellcheck="false"></textarea>
+                <p id="dm-config-error" class="mt-1 min-h-[1rem] text-sm text-[#47605a]"></p>
               </div>
             </div>
 
             <div class="mt-3 flex flex-wrap items-center gap-3 border-t border-edge pt-3">
-              <label class="flex cursor-pointer items-center gap-2 text-[0.66rem] text-[#9fd8b4]">
+              <label class="flex cursor-pointer items-center gap-2 text-sm text-[#9fd8b4]">
                 <input id="dm-config-notify" type="checkbox" class="accent-[#39FF14]" checked />
                 also notify the device (queues <span class="text-neon">CONFIG_SYNC</span>)
               </label>
-              <button id="dm-config-save" class="btn btn-neon ml-auto px-5 py-2 text-xs tracking-[0.18em]" type="button">
+              <button id="dm-config-save" class="btn btn-neon ml-auto px-6 py-3 text-base tracking-[0.16em]" type="button">
                 ⤒ SAVE &amp; SYNC TO ESP
               </button>
             </div>
-            <p id="dm-config-result" class="mt-2 min-h-[1rem] text-[0.68rem] text-[#6d8b84]"></p>
+            <p id="dm-config-result" class="mt-2 min-h-[1rem] text-base text-[#6d8b84]"></p>
           </section>
 
           <!-- ---- d) device log ---- -->
           <section data-tab-panel="logs" class="hidden">
             <div class="flex flex-wrap items-center gap-2">
-              <p class="text-[0.66rem] text-[#6d8b84]">
+              <p class="text-sm text-[#6d8b84]">
                 Live webhook / MQTT traffic for <b id="dm-log-device" class="text-neon">—</b>
               </p>
               <span id="dm-log-count" class="badge ml-auto text-[#8fb39b]">0 LINES</span>
-              <button id="dm-log-pause" class="btn px-2 py-0.5 text-[0.6rem]" type="button">PAUSE</button>
-              <button id="dm-log-clear" class="btn px-2 py-0.5 text-[0.6rem]" type="button">CLEAR</button>
+              <button id="dm-log-pause" class="btn px-2 py-0.5 text-sm" type="button">PAUSE</button>
+              <button id="dm-log-clear" class="btn px-2 py-0.5 text-sm" type="button">CLEAR</button>
             </div>
 
-            <div class="mt-2 rounded-lg border border-edge bg-panel px-3 py-2 text-[0.66rem]">
+            <div class="mt-2 rounded-lg border border-edge bg-panel px-3 py-2 text-sm">
               <p class="text-[#47605a]">
                 UPSTREAM MIRROR
                 <span id="dm-forward" class="ml-2 text-[#6d8b84]">checking…</span>
               </p>
             </div>
 
-            <div id="dm-terminal" class="terminal terminal-body mt-2 h-[330px] px-2.5 py-2 text-neon" role="log" aria-live="polite">
+            <div id="dm-terminal" class="terminal terminal-body mt-2 h-[400px] px-3 py-2.5 text-neon" role="log" aria-live="polite">
               <div id="dm-cursor-line" class="term-prompt">
                 <span class="text-[#47605a]">device@iot:~$</span> <span class="term-cursor"></span>
               </div>
@@ -335,7 +306,7 @@
         <div class="modal-body">
           <!-- ---- forwarding ---- -->
           <section data-set-panel="forwarding">
-            <p class="text-[0.68rem] text-[#6d8b84]">
+            <p class="text-base text-[#6d8b84]">
               Every telemetry batch received over MQTT or
               <code class="text-neon">POST /api/webhook/data</code> is mirrored to the main website asynchronously.
               Delivery attempts are recorded in <code class="text-neon">forward_logs</code>.
@@ -346,7 +317,7 @@
                 <label class="label" for="fwd-url">Main website webhook URL</label>
                 <input id="fwd-url" class="input" type="url" spellcheck="false"
                        placeholder="https://main-website.example.com/api/iot/ingest" />
-                <p class="mt-1 text-[0.6rem] text-[#47605a]">
+                <p class="mt-1 text-sm text-[#47605a]">
                   Stored in SQLite and overrides <code>MAIN_WEBSITE_WEBHOOK_URL</code> from .env.
                 </p>
               </div>
@@ -354,20 +325,20 @@
               <div class="flex flex-wrap items-center gap-3">
                 <button id="fwd-enabled" class="switch" role="switch" aria-checked="false" type="button"
                         aria-label="Enable upstream forwarding"></button>
-                <span class="text-[0.68rem] text-[#9fd8b4]">Forwarding enabled</span>
+                <span class="text-base text-[#9fd8b4]">Forwarding enabled</span>
                 <button id="fwd-test" class="btn ml-auto" type="button">⇑ SEND TEST</button>
                 <button id="fwd-reset" class="btn" type="button" title="Clear the stored value and fall back to .env">CLEAR</button>
                 <button id="fwd-save" class="btn btn-neon" type="button">SAVE</button>
               </div>
-              <p id="fwd-result" class="min-h-[1rem] text-[0.68rem] text-[#6d8b84]"></p>
+              <p id="fwd-result" class="min-h-[1rem] text-base text-[#6d8b84]"></p>
             </div>
 
             <div id="fwd-stats" class="mt-3 grid grid-cols-2 gap-2.5 sm:grid-cols-4"></div>
 
             <div class="mt-3">
               <p class="label">Recent delivery attempts</p>
-              <div class="max-h-[260px] overflow-y-auto rounded-lg border border-edge">
-                <table class="w-full text-left text-[0.64rem]">
+              <div class="max-h-[320px] overflow-y-auto rounded-lg border border-edge">
+                <table class="w-full text-left text-base">
                   <thead class="sticky top-0 bg-panel text-[#47605a]">
                     <tr>
                       <th class="px-2 py-1">TIME</th>
@@ -428,12 +399,12 @@
                   <input id="rule-device" class="input" placeholder="*" value="*" />
                 </div>
               </div>
-              <button class="btn btn-neon w-full py-2 text-xs tracking-[0.18em]" type="submit">+ ADD AUTOMATION RULE</button>
+              <button class="btn btn-neon w-full py-3 text-base tracking-[0.16em]" type="submit">+ ADD AUTOMATION RULE</button>
             </form>
 
             <div class="mt-4 border-t border-edge pt-3">
               <p class="label">Recent triggers</p>
-              <ul id="rule-events" class="space-y-1 text-[0.66rem] text-[#8fb39b]"></ul>
+              <ul id="rule-events" class="space-y-1 text-sm text-[#8fb39b]"></ul>
             </div>
           </section>
 
@@ -441,10 +412,10 @@
           <section data-set-panel="queue" class="hidden">
             <div class="flex items-center gap-2">
               <span id="commands-count" class="badge text-[#8fb39b]">0</span>
-              <span class="text-[0.66rem] text-[#6d8b84]">newest first · retained while devices poll</span>
+              <span class="text-sm text-[#6d8b84]">newest first · retained while devices poll</span>
             </div>
             <div class="mt-2 max-h-[420px] overflow-y-auto rounded-lg border border-edge">
-              <table class="w-full text-left text-[0.66rem]">
+              <table class="w-full text-left text-sm">
                 <thead class="sticky top-0 bg-panel text-[#47605a]">
                   <tr>
                     <th class="px-2 py-1">#</th>
@@ -462,14 +433,14 @@
           <!-- ---- system log ---- -->
           <section data-set-panel="syslog" class="hidden">
             <div class="flex flex-wrap items-center gap-2">
-              <p class="text-[0.66rem] text-[#6d8b84]">Server-wide webhook, MQTT, command and automation log.</p>
+              <p class="text-sm text-[#6d8b84]">Server-wide webhook, MQTT, command and automation log.</p>
               <span id="term-count" class="badge ml-auto text-[#8fb39b]">0 LINES</span>
-              <button id="term-filter-toggle" class="btn px-2 py-0.5 text-[0.6rem]" type="button"
+              <button id="term-filter-toggle" class="btn px-2 py-0.5 text-sm" type="button"
                       title="Only show webhooks, commands and automations">FOCUS</button>
-              <button id="term-pause" class="btn px-2 py-0.5 text-[0.6rem]" type="button">PAUSE</button>
-              <button id="term-clear" class="btn px-2 py-0.5 text-[0.6rem]" type="button">CLEAR</button>
+              <button id="term-pause" class="btn px-2 py-0.5 text-sm" type="button">PAUSE</button>
+              <button id="term-clear" class="btn px-2 py-0.5 text-sm" type="button">CLEAR</button>
             </div>
-            <div id="terminal" class="terminal terminal-body mt-2 h-[440px] px-2.5 py-2 text-neon" role="log" aria-live="polite">
+            <div id="terminal" class="terminal terminal-body mt-2 h-[520px] px-3 py-2.5 text-neon" role="log" aria-live="polite">
               <div id="term-cursor-line" class="term-prompt">
                 <span class="text-[#47605a]">root@iot-dashboard:~$</span> <span class="term-cursor"></span>
               </div>

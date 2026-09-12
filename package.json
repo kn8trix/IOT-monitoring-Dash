@@ -17,8 +17,7 @@
     "postinstall": "npm run vendor",
     "simulate": "node scripts/simulator.js",
     "simulate:mqtt": "node scripts/simulator.js --mqtt",
-    "seed": "node scripts/seed.js",
-    "db:reset": "node scripts/seed.js --reset",
+    "db:reset": "node scripts/reset-db.js",
     "check": "node --check src/server.js && node --check public/js/app.js && node --check scripts/simulator.js"
   },
   "keywords": [

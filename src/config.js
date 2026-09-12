@@ -83,8 +83,14 @@ const config = {
     payloadBytes: toInt(process.env.FORWARD_MAX_PAYLOAD_BYTES, 16384),
   },
 
+  /**
+   * A fresh database is **empty**: no devices, no telemetry, no configs. The
+   * only thing written on first boot is the four baseline automation rules,
+   * which are operator configuration rather than data (and can be disabled).
+   * Devices appear only when real hardware reports in.
+   */
   seed: {
-    deviceCount: toInt(process.env.SEED_DEVICE_COUNT, 220),
+    defaultRules: toBool(process.env.SEED_DEFAULT_RULES, true),
   },
 
   rateLimit: {

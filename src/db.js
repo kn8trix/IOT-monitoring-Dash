@@ -1189,88 +1189,14 @@ function checkpoint() {
 /* Demo seed                                                                  */
 /* -------------------------------------------------------------------------- */
 
-const SENSOR_KITS = [
-  [{ sensor_name: 'temperature', unit: '°C', base: 22, spread: 4 }],
-  [
-    { sensor_name: 'temperature', unit: '°C', base: 24, spread: 5 },
-    { sensor_name: 'humidity', unit: '%', base: 48, spread: 12 },
-  ],
-  [
-    { sensor_name: 'temperature', unit: '°C', base: 26, spread: 6 },
-    { sensor_name: 'pressure', unit: 'hPa', base: 1013, spread: 6 },
-    { sensor_name: 'battery', unit: '%', base: 87, spread: 10 },
-  ],
-  [{ sensor_name: 'co2', unit: 'ppm', base: 640, spread: 220 }],
-  [{ sensor_name: 'current', unit: 'A', base: 4.2, spread: 1.8 }],
-];
-
-const LOCATIONS = ['Plant A', 'Plant B', 'Warehouse', 'Server Room', 'Greenhouse', 'Cold Storage', 'Roof Deck'];
-
-/** Deterministic demo MAC (A4:CF:12 is a real Espressif OUI prefix). */
-function seedMac(index) {
-  const hex = (value, width = 2) => (value & 0xff).toString(16).toUpperCase().padStart(width, '0');
-  return `A4:CF:12:${hex(index >> 16)}:${hex(index >> 8)}:${hex(index)}`;
-}
-
 /**
- * Register `count` demo devices (used on first boot so a fresh install has a
- * populated grid). Idempotent: existing device ids are left untouched.
+ * Create the four baseline automation rules on an empty rules table.
+ *
+ * This is the only thing the server writes on a fresh database. No device, no
+ * telemetry and no config is ever invented — a new install starts with **zero
+ * devices** and the grid shows its empty state until real hardware posts to
+ * `POST /api/webhook/data` (or publishes to `iot/+/telemetry`).
  */
-function seedDevices(count = config.seed.deviceCount) {
-  const target = Math.max(0, Number(count) || 0);
-  if (target === 0) return 0;
-
-  const insert = db.transaction((n) => {
-    let created = 0;
-    for (let i = 1; i <= n; i += 1) {
-      const id = `ESP32-${String(i).padStart(4, '0')}`;
-      if (stmts.getDevice.get(id)) continue;
-      stmts.insertDevice.run({
-        device_id: id,
-        name: `Sensor Node ${i}`,
-        ip: `10.${(Math.floor((i - 1) / 254) % 99) + 1}.${((i - 1) % 254) + 1}.10`,
-        mac: seedMac(i),
-        location: LOCATIONS[(i - 1) % LOCATIONS.length],
-        firmware: `v1.${(i - 1) % 5}.${i % 9}`,
-        last_payload: null,
-        ts: now(),
-      });
-      // Newly seeded devices start offline until they report in.
-      db.prepare(`UPDATE devices SET status = 'offline', last_seen = NULL WHERE device_id = ?`).run(id);
-
-      // Demo custom config so the device-card config tags have something to show
-      // and `GET /api/device/:id/config` returns a realistic payload.
-      stmts.upsertConfig.run({
-        device_id: id,
-        config: JSON.stringify({
-          sample_rate_ms: [1000, 2000, 5000, 10000][(i - 1) % 4],
-          temp_threshold: 28 + (i % 6),
-          relay_pin: 2 + (i % 4),
-        }),
-        updated_by: 'seed',
-        ts: now(),
-      });
-      created += 1;
-    }
-    return created;
-  });
-
-  const created = insert(target);
-  if (created > 0) {
-    log('info', 'SEED', `registered ${created} demo device(s) (SEED_DEVICE_COUNT=${target})`);
-    bus.emit('rules:changed', listRules());
-  }
-  return created;
-}
-
-/** Sensor profile for a seeded device id, used by scripts/simulator.js. */
-function sensorKitFor(deviceId) {
-  const digits = String(deviceId).replace(/\D+/g, '') || '1';
-  const index = (Number.parseInt(digits, 10) - 1) % SENSOR_KITS.length;
-  return SENSOR_KITS[Number.isFinite(index) && index >= 0 ? index : 0];
-}
-
-/** Create the default automation rules on an empty rules table. */
 function seedDefaultRules() {
   if (stmts.countRules.get().c > 0) return 0;
   const defaults = [
@@ -1328,9 +1254,6 @@ module.exports = {
   SETTING_KEYS,
   stats,
   prune,
-  seedDevices,
   seedDefaultRules,
-  sensorKitFor,
-  SENSOR_KITS,
   OPERATORS,
 };

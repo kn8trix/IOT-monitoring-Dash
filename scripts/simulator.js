@@ -5,6 +5,11 @@
  * Fleet simulator — generates realistic telemetry for 200+ virtual devices so
  * the dashboard, charts and automation rules can be exercised without hardware.
  *
+ * Nothing is pre-seeded: each virtual node is registered **dynamically** by the
+ * server the first time its telemetry arrives, exactly like real hardware. Stop
+ * the simulator and the fleet stays in the database as offline devices; delete
+ * `data/iot.db` (or run `npm run db:reset`) to get back to an empty grid.
+ *
  *   node scripts/simulator.js                # HTTP webhooks (220 devices)
  *   node scripts/simulator.js --devices 50 --interval 2000
  *   node scripts/simulator.js --mqtt         # publish to iot/<id>/telemetry
@@ -12,8 +17,6 @@
  */
 
 const { randomUUID } = require('crypto');
-const { SENSOR_KITS } = require('../src/db');
-const { bus } = require('../src/events'); // no-op for the bus, keeps config loading
 
 /* -------------------------------------------------------------------------- */
 /* CLI                                                                        */
@@ -85,7 +88,23 @@ const args = parseArgs(process.argv);
 
 const LOCATIONS = ['Plant A', 'Plant B', 'Warehouse', 'Server Room', 'Greenhouse', 'Cold Storage', 'Roof Deck'];
 
-/** Deterministic demo MAC mirroring src/db.js (`seedMac`). */
+/** Rotating sensor kits: which measurements a virtual node reports. */
+const SENSOR_KITS = [
+  [{ sensor_name: 'temperature', unit: '°C', base: 22, spread: 4 }],
+  [
+    { sensor_name: 'temperature', unit: '°C', base: 24, spread: 5 },
+    { sensor_name: 'humidity', unit: '%', base: 48, spread: 12 },
+  ],
+  [
+    { sensor_name: 'temperature', unit: '°C', base: 26, spread: 6 },
+    { sensor_name: 'pressure', unit: 'hPa', base: 1013, spread: 6 },
+    { sensor_name: 'battery', unit: '%', base: 87, spread: 10 },
+  ],
+  [{ sensor_name: 'co2', unit: 'ppm', base: 640, spread: 220 }],
+  [{ sensor_name: 'current', unit: 'A', base: 4.2, spread: 1.8 }],
+];
+
+/** Deterministic demo MAC (A4:CF:12 is a real Espressif OUI prefix). */
 function deviceMac(index) {
   const hex = (value) => (value & 0xff).toString(16).toUpperCase().padStart(2, '0');
   return `A4:CF:12:${hex(index >> 16)}:${hex(index >> 8)}:${hex(index)}`;

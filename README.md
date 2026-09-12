@@ -3,9 +3,13 @@
 Space-Black / Neon-Green operator console for monitoring and controlling **200+
 IoT devices** in real time.
 
-- **Device grid:** large clickable cards — heartbeat status badge, IP/MAC
-  metadata, the current reading in big neon type, last-update timestamp and a
-  summary of the node's active custom config
+- **No mock data:** a fresh database holds **0 devices** and the grid shows
+  `NO IOT DEVICES REGISTERED YET / Waiting for incoming telemetry…` until real
+  hardware reports in. Nothing is ever fabricated
+- **Device grid:** large clickable cards showing only core info — device id,
+  ONLINE/OFFLINE heartbeat badge, IP address, the live reading in huge neon type
+  (`text-5xl`/`text-6xl`) and the last-update time. Larger type throughout, so the
+  console is readable from across the room
 - **Device inspector modal:** click any card for a per-device real-time chart, a
   command panel, a custom-config editor (`sample_rate_ms`, `temp_threshold`, …)
   with *Save & Sync to ESP*, and a device-only live console
@@ -18,6 +22,7 @@ IoT devices** in real time.
 - **Storage:** SQLite (`data/iot.db`) — devices, telemetry, commands, automation
   rules, device configs, forward logs, settings
 - **Realtime:** Socket.io fan-out (telemetry, commands, config, forwarding, log)
+- **Summary strip:** Total devices · Online · Offline · Forwarded webhooks
 - **Automation:** threshold rules, e.g. *if temperature > 30 then `RELAY_OFF`*
 
 Full documentation — architecture, APIs, flashing ESP32/ESP8266 firmware, deployment
@@ -45,8 +50,12 @@ docker compose down                                                      # stop
 ```bash
 npm install
 npm start          # http://localhost:3000 (MQTT optional — the server degrades gracefully)
-npm run simulate   # optional: 220 synthetic devices
+npm run simulate   # optional: 220 *virtual* devices, registered like real ones
 ```
+
+The dashboard starts empty and populates the moment a device posts. `npm run
+simulate` is only a development convenience — it talks to the same webhook a real
+ESP would, and `npm run db:reset` removes everything again.
 
 ## Send your first reading
 
@@ -100,7 +109,7 @@ curl -X POST http://localhost:3000/api/webhook/command \
 | `npm run build` | vendor browser libs + compile Tailwind (`public/css/app.css`) |
 | `npm run simulate` | 220 virtual devices over HTTP |
 | `npm run simulate:mqtt` | 220 virtual devices over MQTT |
-| `npm run db:reset` | wipe and reseed `data/iot.db` |
+| `npm run db:reset` | wipe `data/iot.db` to a schema-only, 0-device state |
 | `npm run check` | syntax check the entry points |
 
 > After changing `public/index.html`, `public/js/app.js` or `public/css/input.css`,

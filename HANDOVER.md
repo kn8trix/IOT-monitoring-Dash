@@ -89,7 +89,7 @@ rule takes exactly the same path — one place to debug, one place to log.
 ├── src/
 │   ├── server.js        Express + Socket.io bootstrap, background jobs, shutdown
 │   ├── config.js        every env var, with defaults
-│   ├── db.js            schema, migrations, prepared statements, seeds
+│   ├── db.js            schema, migrations, prepared statements, queries
 │   ├── ingest.js        payload normalisation + persistence + fan-out
 │   ├── forwarder.js     upstream forwarding queue (MAIN_WEBSITE_WEBHOOK_URL)
 │   ├── automation.js    rule engine (cooldowns, burst limiter)
@@ -105,8 +105,9 @@ rule takes exactly the same path — one place to debug, one place to log.
 │   │                    modal, config editor, settings, terminals)
 │   └── vendor/chart.umd.js   vendored Chart.js (offline-capable)
 ├── scripts/
-│   ├── simulator.js     synthetic 200+ device fleet
-│   ├── seed.js          schema + demo devices + default rules
+│   ├── simulator.js     synthetic 200+ device fleet (dev tool — registers
+│   │                    devices dynamically, exactly like real hardware)
+│   ├── reset-db.js      wipes iot.db back to a schema-only, ZERO-device state
 │   └── vendor.js        copies browser libs from node_modules → public/vendor
 ├── mosquitto/config/mosquitto.conf
 ├── data/iot.db          SQLite (git-ignored, created on first boot)
@@ -152,37 +153,36 @@ modals (§3.2, §3.3), so the grid gets the full width and the operator's attent
 
 Every registered device renders as a **large card** (`public/js/app.js` →
 `cardInner()`): minimum height **260 px**, laid out `1 → 2 → 3` columns
-(mobile → md → xl, capped at three on desktop).
+(mobile → md → xl, capped at three on desktop). A card deliberately carries
+**only core information** — identity, liveness, address, the live number and when
+it was last seen. Everything heavier lives one click away in the inspector (§3.2).
 
 ```
 ┌────────────────────────────────────────────────────┐
-│ Sensor Node 6                        ◉ ONLINE      │  ← name + id, heartbeat badge
-│ ESP32-0006                                         │
-│ IP 10.1.6.10 · Greenhouse                          │  ← monospace metadata
-│ MAC A4:CF:12:00:00:06                              │
+│ ESP32-TANK-01                        ◉ ONLINE      │  ← device id + status badge
+│ Tank Node                                          │  ← name, only when it differs
+│ IP 10.0.0.7                                        │  ← enlarged monospace address
 │                                                    │
-│ TEMPERATURE                                        │  ← primary sensor label
-│ 24.6 °C                                            │  ← large bold neon reading
-│ humidity 51.2 % · pressure 1012.8 hPa              │  ← secondary readings
+│ TEMPERATURE                                        │  ← which sensor is shown
+│ 24.6 °C                                            │  ← huge glowing reading
 │                                                    │
-│ CUSTOM CONFIG  rev 3                               │  ← active config summary
-│ [sample_rate_ms 1000] [temp_threshold 33] [relay_pin 2]
 │ ────────────────────────────────────────────────── │
-│ Updated 3 seconds ago                      OPEN ▸  │  ← last ping
+│ Updated 3 seconds ago                   INSPECT ▸  │  ← last ping
 └────────────────────────────────────────────────────┘
 ```
 
 **Headline reading.** `primarySensor()` picks the headline series — `temperature`
 when present, otherwise the first sensor alphabetically — rendered by
-`.reading-value` in large bold `#39FF14` with the unit as a small suffix. Up to
-three other sensors follow as a secondary line, and the block reads
+`.reading-value` at `clamp(2.75rem, 5.6vw, 3.75rem)` (≈44–60 px, i.e. `text-5xl` /
+`text-6xl`) in bold `#39FF14` with the unit as a suffix. The block reads
 `AWAITING DATA` until the first frame arrives.
 
-**Active config summary.** `configTags()` renders up to three `key value` pills
-from the device's saved configuration (plus `+N` when more keys exist) next to the
-revision in the label (`CUSTOM CONFIG rev 3`). A node with nothing saved shows
-`no custom config`. This is the at-a-glance answer to "which nodes have been
-re-provisioned" — §3.4 covers where those values come from.
+**What was removed from the card** (and where it went): MAC address, location,
+secondary sensor readings, the custom-config tag summary and the inline
+`RELAY ON` / `RELAY OFF` / `LOGS` buttons. All of it is in the inspector modal —
+identity and configuration in the header/config tab, secondary readings in the
+chart and stat strip, forwarding status in the logs tab. The card was reduced on
+purpose: at 200+ nodes the grid is a scanning surface, not a control surface.
 
 **Status badge / heartbeat rule.** A card is `ONLINE` while its last ping is
 younger than **30 s** — the glowing neon-green dot pulses and the badge reads
@@ -203,15 +203,16 @@ toggles, the command form and the per-device log all live in the modal, so a str
 click can never queue a command onto the fleet.
 
 **Live updates without re-rendering.** When `telemetry_update` / `device_status`
-arrives the matching card is patched in place (`updateCard()`): headline and
-secondary readings, last-ping label, IP/MAC/firmware, config tags and the badge. The
+arrives the matching card is patched in place (`updateCard()`): the headline
+reading, its label and unit, the IP and the last-ping label. The
 card then runs a ~0.9 s neon border flash (`.card-live-flash`) as a visual
 "fresh data" cue — this is `box-shadow` only, so it never fights the
 `is-selected` / hover border colours. A full grid re-render only happens when the
 *composition* changes (a device enters/leaves the current filter or sort order),
 which is detected by comparing a device-id signature at most every 500 ms.
 
-**Sticky filter bar.** Search (device id / name / IP / MAC / location),
+**Sticky filter bar.** Search (device id / name / IP / MAC / location — the modal
+still shows MAC, so it stays searchable even though it left the card),
 `ALL DEVICES` / `ONLINE ONLY` / `OFFLINE ONLY` filters, sort, and the live census
 `TOTAL: X | ONLINE: Y | OFFLINE: Z`. The bar is `position: sticky` beneath the
 header; `--header-h` is published by a ResizeObserver so it stays aligned when the
@@ -222,6 +223,27 @@ top bar wraps on narrow screens. The census always counts the search-scoped set
 Performance guards: `PAGE_SIZE = 12` of these large cards per page ("LOAD MORE"),
 per-card patches instead of re-renders, Chart.js instances created only for the
 open inspector, and heartbeat repaints every 5 s touching only visible cards.
+
+**Empty state.** With nothing registered the grid renders one full-width
+`.empty-state` tile instead of cards (`emptyState()` in `public/js/app.js`):
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                              ● (pulsing neon dot)                     │
+│                  NO IOT DEVICES REGISTERED YET                       │
+│                     Waiting for incoming telemetry…                   │
+│   A card appears here the instant a device reports in — this dashboard│
+│   fabricates nothing. Post a reading, or publish to iot/<id>/telemetry│
+│   $ curl -X POST /api/webhook/data …                                 │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+The headline is `1.75rem` neon with a glow, the copy is `1.0625rem`, and the
+snippet sits in a bordered `#05080A` code block. A second flavour
+(`NO MATCHING DEVICES`) is shown when devices exist but the current search/filter
+matches none, so an over-eager filter never looks like a dead server. The grid
+note underneath reads `waiting for the first device to report in` in the first
+case and `no devices match the current filter` in the second.
 
 ### 3.2 Device inspector modal
 
@@ -309,16 +331,40 @@ system UI monospace). Metrics, telemetry readouts, terminal lines and the grid a
 use it, matching the operator-console aesthetic. No web fonts are downloaded, so
 the dashboard renders identically on an offline LAN.
 
+**The scale was raised one notch across the board** so the console reads from a
+distance (wall display / shop floor). `@theme` overrides Tailwind's defaults and
+the `.component` sizes in `public/css/input.css` follow them:
+
+| Element | Class | Size | ≈ px |
+| --- | --- | --- | --- |
+| Live sensor reading (card) | `.reading-value` | `clamp(2.75rem, 5.6vw, 3.75rem)` | 44 → 60 |
+| Header title | `h1.neon-title` | `1.25–1.5rem` | 20 – 24 |
+| Summary metric value | `.stat-value` | `2.25rem` | 36 |
+| Device id (card) | `.device-id` | `1.25rem` | 20 |
+| Modal title | `.modal-title` | `1.625rem` | 26 |
+| IP / metadata, modal subtitle, terminal lines | `.device-ip`, `.modal-sub`, `.terminal-body` | `1.0625rem` | 17 |
+| Tabs, buttons, badges, labels, config inputs | `.tab`, `.btn`, `.badge`, `.label`, `.cfg-key/.cfg-val` | `0.9375–1.0625rem` | 15 – 17 |
+| Small print | `text-sm` | `0.9375rem` | 15 |
+
+There is no text smaller than 13 px anywhere in the UI (`--text-xs`), and no
+`text-[0.5x rem]` arbitrary sizes remain — every one was replaced with a scale
+step. Terminal bodies grew to `1.0625rem` with `1.45` line-height, and their boxes
+were raised to 400 px (device inspector) / 520 px (system log) so the same number
+of lines still fit.
+
 ### Layout
 
 1. **Header** — glowing `IOT // DASHBOARD`, `SYSTEM STATUS: ACTIVE`, MQTT badge,
-   node counters, connected-client count, clock.
-2. **Stat strip** — devices total/online/offline, readings per minute, telemetry
-   rows, queued commands, active rules, uptime.
+   socket link, `⚙ SETTINGS` / `▚ SYSTEM LOG` buttons, clock.
+2. **Summary metrics** — exactly four tiles: **Total devices**, **Online**,
+   **Offline**, **Forwarded webhooks**, each a `2.25rem` neon number under a
+   `text-sm` label. Everything else that used to sit here (readings/min, configured
+   count, queued commands, uptime) moved into the settings modal or `/api/health`.
 3. **Device grid** — the entire body: large clickable cards (§3.1) beneath a
    sticky search / status-filter / census bar, paginated with `LOAD MORE`.
 4. **Device inspector modal** — per-device real-time chart, command panel, custom
-   configuration editor and device-scoped console (§3.2).
+   configuration editor, device-scoped console and that device's upstream webhook
+   status (§3.2).
 5. **Settings modal** — upstream data forwarding, automation rules, the command
    queue and the global system log (§3.3).
 
@@ -337,6 +383,40 @@ the dashboard renders identically on an offline LAN.
 | `device_configs` | per-device custom configuration | `device_id` PK, `config` (JSON text), `revision`, `updated_by`, `updated_at` |
 | `forward_logs` | upstream forwarding audit trail | `id` PK, `device_id`, `url`, `status` (`success`/`failed`/`dropped`), `http_status`, `duration_ms`, `error`, `source` (`http`/`mqtt`), `created_at` |
 | `settings` | runtime-overridable system settings | `key` PK, `value`, `updated_at`, `updated_by` |
+
+### 4.1 Empty by design — there is no mock data
+
+**A fresh database contains zero devices.** `src/db.js` has no device seeder at
+all — the factory-fixture generator that used to create 220 fake offline
+"Sensor Node" rows (plus demo configs and a demo MAC scheme) was deleted, together
+with the old `scripts/seed.js`.
+
+| What creates rows | When |
+| --- | --- |
+| `POST /api/webhook/data` | a device posts its first reading → `upsertDevice()` registers it |
+| MQTT `iot/<id>/telemetry` | same path, `source: 'mqtt'` |
+| `GET/POST /api/webhook/command/poll` | a polling device refreshing its liveness |
+| `POST /api/device/:id/config` | an operator saving a config from the dashboard |
+| **nothing at boot** | the server only ensures the baseline automation rules |
+
+The one thing written on an empty database is the four baseline automation rules
+(`seedDefaultRules()`), because they are operator *configuration* rather than
+data, and the Automation tab would otherwise have nothing to show. Disable with
+`SEED_DEFAULT_RULES=false` if you want a truly blank install.
+
+Consequences worth knowing:
+
+- The dashboard shows `NO IOT DEVICES REGISTERED YET / Waiting for incoming
+telemetry…` until real hardware reports in (§3.1). This is the expected first-run
+state, not a fault.
+- Device `name`, `ip`, `mac`, `location` and `firmware` are only ever what the
+device itself sent — nothing is invented, so a card showing `IP —` simply means
+that node has not reported an address yet.
+- `scripts/simulator.js` is a **development** tool, not a seeder: it POSTs (or
+publishes) telemetry for virtual nodes, so those devices are created by the same
+code path as real ones. Nothing it does happens automatically.
+- `npm run db:reset` (`scripts/reset-db.js`) wipes `iot.db` back to this state —
+schema only, 0 devices, 0 telemetry rows, baseline rules.
 
 Indexes exist on `telemetry(device_id, sensor_name, created_at DESC)`,
 `telemetry(created_at DESC)`, `commands(device_id, status, id)`,
@@ -1114,7 +1194,7 @@ values through `environment:` in `docker-compose.yml`.
 | `SWEEP_INTERVAL_SECONDS` | `15` | liveness sweep cadence |
 | `TELEMETRY_RETENTION_DAYS` | `14` | hourly prune (`0` disables) |
 | `TELEMETRY_MAX_ROWS` | `2000000` | hard row cap, oldest trimmed first |
-| `SEED_DEVICE_COUNT` | `220` | demo devices registered on an empty DB (`0` = none) |
+| `SEED_DEFAULT_RULES` | `true` | create the 4 baseline automation rules on an empty rules table. A fresh DB has **0 devices** either way — there is no device seeder |
 | `RATE_LIMIT_WINDOW_SECONDS` / `RATE_LIMIT_MAX_REQUESTS` | `60` / `600` | per-IP throttle on `/api` |
 | `MAIN_WEBSITE_WEBHOOK_URL` | *(empty)* | upstream site that receives a copy of every telemetry batch (§6.4). Overridable at runtime from the Settings modal |
 | `MAIN_WEBSITE_FORWARD_ENABLED` | `false` | master switch for forwarding (defaults to `true` when a URL is set) |
@@ -1137,8 +1217,7 @@ npm run dev            # same, with --watch auto-restart
 npm run watch:css      # Tailwind in watch mode (second terminal)
 npm run simulate       # 220 virtual devices over HTTP webhooks
 npm run simulate:mqtt  # 220 virtual devices over MQTT
-npm run seed           # schema + demo devices + default rules
-npm run db:reset       # delete data/iot.db and seed it again
+npm run db:reset       # wipe data/iot.db → schema only, 0 devices, 4 baseline rules
 npm run check          # node --check on the main entry points
 ```
 
@@ -1148,11 +1227,17 @@ retried every 4 s, the dashboard keeps working over HTTP, and commands stay
 
 ---
 
-## 13. Simulator
+## 13. Simulator (optional development tool)
 
 ```bash
 node scripts/simulator.js --devices 220 --interval 5000 --anomaly 0.05
 ```
+
+This is **not** a seeder. Nothing here runs automatically and nothing is written
+unless the virtual node's telemetry actually reaches the server, at which point
+the device is registered by exactly the same code path as real hardware
+(`upsertDevice` via the ingest pipeline). Stop the simulator and those devices
+simply age into `OFFLINE`; run `npm run db:reset` to clear them out.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -1172,15 +1257,19 @@ battery; CO₂; current) and random-walks around a realistic baseline.
 
 ## 14. Verification performed on this handover
 
-Two passes: the platform (backend, ingest, automation, MQTT, schema) and the
-post-refactor UI (modal design, custom config, upstream forwarding).
+Three passes: the platform (backend, ingest, automation, MQTT, schema), the
+post-refactor UI (modal design, custom config, upstream forwarding), and the
+most recent "seedless + simplified + enlarged type" pass.
 
 **Platform**
 
 | Check | Result |
 | --- | --- |
 | `npm install` (native `better-sqlite3` binding loads) | ✅ |
-| Server boot: schema create + migration to v3, 220 demo devices seeded, 4 default rules | ✅ |
+| Server boot: schema create + migration to v3, **0 devices**, 4 baseline rules | ✅ |
+| `npm run db:reset` → schema only, `devices: 0`, `telemetry rows: 0` | ✅ |
+| Boot log contains no seed/demo line (grepped for `seed|demo`) | ✅ |
+| First real webhook → exactly 1 device registered, ONLINE, with only the fields the device sent | ✅ |
 | Boot with **no** MQTT broker (degrades, keeps serving, retries every 4 s) | ✅ |
 | `POST /api/webhook/data` JSON / `sensors{}` / bare `text/plain` | ✅ 201, rows + device upsert |
 | Device auto-registration from first reading; second reading → `online` | ✅ |
@@ -1206,23 +1295,43 @@ post-refactor UI (modal design, custom config, upstream forwarding).
 | `docker compose config` validation | ✅ |
 | `docker compose build` / container smoke test | ⏳ pending Docker daemon (`docker-on`) |
 
-**Post-refactor UI** — driven in headless Chrome over the DevTools protocol (real
+**Modal UI pass** — driven in headless Chrome over the DevTools protocol (real
 DOM, real Chart.js, real socket, live simulated fleet), `59/59` checks passed, run
 twice against a fresh database:
 
 | Check | Result |
 | --- | --- |
 | Main view simplified: global terminal, global chart and command form all absent from the body; both modals start hidden | ✅ |
-| Large cards: 260 px min-height, 3 desktop columns, pointer cursor, and name + id + IP + badge + reading + updated + config tags all present | ✅ |
-| Hover: border `#1E2A34` → `rgba(57,255,20,0.55)` plus an outer neon glow | ✅ |
 | Card click → inspector scoped to that device (header shows its id, IP, MAC, ONLINE) | ✅ |
 | Telemetry tab: four tabs present, only the active panel visible, sensor picker populated, 7+ points plotted for **that** device, canvas painted, min/max/avg readout filled | ✅ |
 | Commands tab: `RELAY_ON` send → `⧗ queued`, row added to history, line written to the device console | ✅ |
 | Config tab: form rows match the saved keys, `SAVE & SYNC TO ESP` reports a revision, revision bumps 1 → 2, value persisted in SQLite | ✅ |
 | Logs tab: stamped with the open device, backfilled history, blinking cursor, PAUSE/CLEAR present, other devices' lines absent, live webhook appended while open | ✅ |
-| Live patching: card DOM node identity preserved, reading updated in place, neon flash fired, badge → ONLINE on heartbeat, `Updated …` refreshed | ✅ |
 | Settings modal: four tabs, forwarding panel renders URL + enable + test + save + logs, save reports `✓ forwarding active · source: database`, value persisted server-side | ✅ |
+| Live patching: card DOM node identity preserved, reading updated in place, neon flash fired, badge → ONLINE on heartbeat, `Updated …` refreshed | ✅ |
 | Runtime health: socket connected, **0 uncaught JS errors** | ✅ |
+
+**Seedless + typography pass** — the same headless-Chrome rig, started against a
+database wiped by `npm run db:reset` so the empty state is exercised first and a
+device is registered by a real webhook mid-run. **56/56 checks passed:**
+
+| Check | Result |
+| --- | --- |
+| Empty database → 0 cards, `.empty-state` rendered full-width with a pulsing neon dot | ✅ |
+| Exact copy: `NO IOT DEVICES REGISTERED YET` / `Waiting for incoming telemetry…` | ✅ |
+| Grid note `waiting for the first device to report in`, census `TOTAL: 0 \| ONLINE: 0 \| OFFLINE: 0`, LOAD MORE hidden | ✅ |
+| Summary strip is exactly 4 tiles (Total / Online / Offline / Forwarded) and the old 8-tile strip is gone from the DOM | ✅ |
+| A single real webhook → card appears **without a reload**, empty state removed, exactly 1 card | ✅ |
+| Card content: device id, ONLINE badge + pulsing dot, IP, reading `24.6 C`, sensor label, `Updated …` | ✅ |
+| Card exclusions: no MAC, no config tags, no secondary readings | ✅ |
+| Card geometry: 260 px min-height, pointer cursor, `INSPECT` affordance | ✅ |
+| Measured type: reading **60 px**, device id **20 px**, IP **17 px**, badge **15 px** | ✅ |
+| Measured type: header title **24 px**, stat labels **15 px**, stat values **36 px**, filter buttons **15 px**, search input **17 px** | ✅ |
+| Modal type: title **26 px**, subtitle / tabs / terminal lines / inputs / send button all **17 px** | ✅ |
+| Inspector still scoped correctly, chart created, 4 tabs, per-device console stamped, upstream webhook status shown | ✅ |
+| Live patching after the empty state: reading → `41.25`, neon flash, `Updated …` refreshed, census still 1 | ✅ |
+| Socket connected, **0 uncaught JS errors** | ✅ |
+| Automation still fires on real data (`temperature=41.25 > 30 → RELAY_OFF`) | ✅ |
 
 ---
 
@@ -1275,6 +1384,21 @@ twice against a fresh database:
    firmware defaults with `has_custom: false`, because a factory-fresh board must
    be able to provision itself at boot (§6.5). An explicit `DELETE` is how you
    remove a saved config.
+7. **All device fixtures were deleted; a fresh database is empty** (§4.1). The
+   220-device generator, its demo configs and the demo MAC scheme are gone, along
+   with `scripts/seed.js` — `npm run db:reset` now wipes rather than seeds. Expect
+   `NO IOT DEVICES REGISTERED YET` on first boot; that is the designed state, and
+   the dashboard fills up as hardware reports in. Only the four baseline
+   automation rules are still written on an empty rules table
+   (`SEED_DEFAULT_RULES=false` disables that too).
+8. **Card content was cut back to core fields** (id, status, IP, live reading,
+   last ping). MAC, location, secondary readings, config tags and the inline relay
+   buttons moved into the inspector modal — the modal remains the full control
+   surface, so nothing is unreachable.
+9. **Typography runs larger than a default Tailwind build** (§Typography): a
+   `@theme` type scale plus enlarged component sizes, with no text below 13 px and
+   a `text-5xl`/`text-6xl` live reading. Terminal panels were made taller (400 px /
+   520 px) so the bigger line height keeps the same number of visible lines.
 
 ---
 
@@ -1282,6 +1406,9 @@ twice against a fresh database:
 
 | Symptom | Cause / fix |
 | --- | --- |
+| `NO IOT DEVICES REGISTERED YET` after a fresh install | expected — the database starts empty by design (§4.1). Point a device at `POST /api/webhook/data` (or `npm run simulate` for a virtual fleet) and cards appear immediately |
+| Want demo data back temporarily | `node scripts/simulator.js --devices 220` registers a virtual fleet through the real ingest path; `npm run db:reset` clears it again |
+| Old fake "Sensor Node" rows still in the dashboard | they were created by a pre-`f6cd263` build. `npm run db:reset` (server stopped) wipes and recreates the DB with 0 devices |
 | Dashboard loads unstyled | `public/css/app.css` missing → `npm run build:css` |
 | Header badge `MQTT: OFFLINE` | broker not running or wrong `MQTT_URL`. Inside compose it must be `mqtt://mqtt-broker:1883` |
 | Commands stay `pending` | broker down **and** the device is not polling. Check `/api/mqtt/status`, then `docker compose logs mqtt-broker` |

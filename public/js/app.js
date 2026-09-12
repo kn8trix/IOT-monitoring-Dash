@@ -93,17 +93,6 @@
     return `${Math.floor(h / 24)}d ago`;
   }
 
-  function fmtUptime(seconds) {
-    const s = Math.max(0, Math.floor(seconds || 0));
-    const d = Math.floor(s / 86400);
-    const h = Math.floor((s % 86400) / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    if (d) return `${d}d ${h}h`;
-    if (h) return `${h}h ${m}m`;
-    if (m) return `${m}m ${s % 60}s`;
-    return `${s}s`;
-  }
-
   function deviceAge(device) {
     return device && device.last_seen ? Math.max(0, Date.now() - device.last_seen) : Infinity;
   }
@@ -142,7 +131,7 @@
 
   function toast(message, level = 'info', ttl = 4200) {
     const el = document.createElement('div');
-    el.className = `panel fade-in px-3 py-2 text-[0.7rem] ${TOAST_STYLES[level] || TOAST_STYLES.info}`;
+    el.className = `panel fade-in px-3.5 py-2.5 text-base ${TOAST_STYLES[level] || TOAST_STYLES.info}`;
     el.textContent = message;
     $('toasts').appendChild(el);
     setTimeout(() => {
@@ -187,23 +176,19 @@
   /* Stats                                                                  */
   /* ---------------------------------------------------------------------- */
 
+  /**
+   * The four summary numbers in the header strip: total, online, offline and
+   * forwarded webhooks. Everything else lives in the settings modal.
+   */
   function renderStats(stats) {
     if (!stats) return;
     state.stats = stats;
-    const configured = [...state.devices.values()].filter((d) => d.config_revision > 0).length;
+    const forwarded = stats.forward_stats ? stats.forward_stats.success : (stats.forward?.delivered ?? 0);
 
     $('stat-total').textContent = stats.devices.total;
     $('stat-online').textContent = stats.devices.online;
     $('stat-offline').textContent = stats.devices.offline;
-    $('stat-rate').textContent = stats.telemetry.last_minute;
-    $('stat-configured').textContent = configured;
-    $('stat-pending').textContent = stats.commands.pending;
-    $('stat-forwarded').textContent = stats.forward_stats ? stats.forward_stats.success : (stats.forward?.delivered ?? 0);
-    $('stat-uptime').textContent = fmtUptime(stats.uptime_seconds);
-
-    $('header-online').textContent = stats.devices.online;
-    $('header-total').textContent = stats.devices.total;
-    $('header-rate').textContent = stats.telemetry.last_minute;
+    $('stat-forwarded').textContent = forwarded;
 
     if (stats.forward) renderForwardStatus(stats.forward, stats.forward_stats);
   }
@@ -283,34 +268,22 @@
       `<span class="text-[#2d4a44]"> | </span><span class="text-[#6d8b84]">OFFLINE:</span> <b class="${offline ? 'text-[#ff7b72]' : 'text-[#6d8b84]'}">${offline}</b>`;
   }
 
-  /** Summary tags of the device's saved custom config. */
-  function configTags(device) {
-    const entries = Object.entries(device.config || {});
-    if (!entries.length) return '<span class="config-tag config-tag-none">no custom config</span>';
-    const shown = entries.slice(0, 3).map(
-      ([key, value]) =>
-        `<span class="config-tag" title="${esc(key)}=${esc(JSON.stringify(value))}">${esc(key)}
-           <b class="text-[#d9ffcf]">${esc(typeof value === 'boolean' ? String(value) : JSON.stringify(value))}</b></span>`,
-    );
-    if (entries.length > 3) shown.push(`<span class="config-tag">+${entries.length - 3}</span>`);
-    return shown.join('');
-  }
-
+  /**
+   * A card carries only its core identity: device id, status, IP, the live
+   * reading and when it was last heard from. Everything else (chart, commands,
+   * configuration, console, forwarding) belongs to the inspector modal.
+   */
   function cardInner(device) {
     const online = isOnline(device);
     const sensor = primarySensor(device);
     const primary = sensor ? (device.metrics || {})[sensor] : null;
-    const others = Object.entries(device.metrics || {})
-      .filter(([name]) => name !== sensor)
-      .slice(0, 3)
-      .map(([name, metric]) => `${esc(name)} ${esc(fmtNumber(metric.value))}${metric.unit ? ` ${esc(metric.unit)}` : ''}`)
-      .join(' · ');
+    const name = device.name && device.name !== device.device_id ? device.name : null;
 
     return `
-      <header class="flex items-start gap-2">
+      <header class="flex items-start gap-3">
         <div class="min-w-0 flex-1">
-          <h3 class="device-name" title="${esc(device.name || device.device_id)}">${esc(device.name || device.device_id)}</h3>
-          <p class="device-id">${esc(device.device_id)}</p>
+          <h3 class="device-id" title="${esc(device.device_id)}" data-role="device-id">${esc(device.device_id)}</h3>
+          ${name ? `<p class="reading-secondary" title="${esc(name)}">${esc(name)}</p>` : ''}
         </div>
         <span class="status-badge ${online ? 'status-online' : 'status-offline'}" data-role="badge">
           <span class="dot ${online ? 'dot-online' : 'dot-offline'}" data-role="dot"></span>
@@ -318,30 +291,18 @@
         </span>
       </header>
 
-      <p class="text-[0.63rem] text-[#6d8b84]">
-        IP <b class="text-[#9fd8b4]" data-role="ip">${esc(device.ip || '—')}</b>
-        <span class="text-[#33504a]">·</span> ${esc(device.location || 'unassigned')}
-      </p>
-      <p class="text-[0.6rem] text-[#47605a]">MAC <span data-role="mac">${esc(device.mac || '—')}</span></p>
+      <p class="device-ip">IP <b data-role="ip">${esc(device.ip || '—')}</b></p>
 
-      <div class="mt-1">
+      <div class="my-auto">
         <p class="metric-label" data-role="reading-label">${esc(sensor ? metricLabel(sensor) : 'AWAITING DATA')}</p>
         <p class="reading-value"><span data-role="reading">${esc(primary ? fmtNumber(primary.value) : '--')}</span>${
           primary && primary.unit ? `<span class="reading-unit" data-role="reading-unit">${esc(primary.unit)}</span>` : ''
         }</p>
-        <p class="reading-secondary" data-role="secondary">${others || (primary ? '' : 'no readings received yet')}</p>
       </div>
 
-      <div class="mt-auto">
-        <p class="metric-label mb-0.5">CUSTOM CONFIG <span class="text-[#33504a]" data-role="config-rev">${
-          device.config_revision ? `rev ${device.config_revision}` : ''
-        }</span></p>
-        <div class="flex flex-wrap gap-1" data-role="config-tags">${configTags(device)}</div>
-      </div>
-
-      <footer class="flex items-center gap-2 border-t border-edge pt-2 text-[0.6rem] text-[#47605a]">
-        <span data-role="seen">${esc(updatedLabel(device))}</span>
-        <span class="ml-auto text-neon glow-text-soft">OPEN ▸</span>
+      <footer class="flex items-center gap-2 border-t border-edge pt-2.5">
+        <span class="card-meta" data-role="seen">${esc(updatedLabel(device))}</span>
+        <span class="ml-auto text-base text-neon glow-text-soft">INSPECT ▸</span>
       </footer>`;
   }
 
@@ -389,6 +350,10 @@
     grid.textContent = '';
     state.cards.clear();
 
+    // Empty fleet (nothing has ever reported in) or an over-eager filter.
+    if (state.devices.size === 0) grid.appendChild(emptyState('waiting'));
+    else if (!matching.length) grid.appendChild(emptyState('filtered'));
+
     const fragment = document.createDocumentFragment();
     for (const device of list) {
       const card = createCard(device);
@@ -401,8 +366,37 @@
     renderCensus(matching);
     $('device-grid-note').textContent = matching.length
       ? `showing ${list.length} of ${matching.length} matching · ${state.devices.size} registered · heartbeat < ${HEARTBEAT_MS / 1000}s · click a card to inspect`
-      : 'no devices match the current filter';
+      : state.devices.size === 0
+        ? 'waiting for the first device to report in'
+        : 'no devices match the current filter';
     $('device-more').classList.toggle('hidden', list.length >= matching.length);
+  }
+
+  /**
+   * Placeholder for an empty grid, in two flavours: no devices at all (the
+   * normal state of a fresh install) and "nothing matches the filter".
+   */
+  function emptyState(kind) {
+    const el = document.createElement('div');
+    el.className = 'empty-state fade-in';
+
+    if (kind === 'filtered') {
+      el.innerHTML =
+        '<p class="empty-state-title text-[#9fd8b4]">NO MATCHING DEVICES</p>' +
+        '<p class="empty-state-text">Nothing matches the current search or status filter.</p>' +
+        '<p class="empty-state-hint">Clear the search box, or switch back to ALL DEVICES.</p>';
+      return el;
+    }
+
+    el.innerHTML =
+      '<span class="dot dot-online"></span>' +
+      '<p class="empty-state-title">NO IOT DEVICES REGISTERED YET</p>' +
+      '<p class="empty-state-text">Waiting for incoming telemetry…</p>' +
+      '<p class="empty-state-hint">A card appears here the instant a device reports in — this dashboard fabricates nothing.<br />' +
+      'Post a reading, or publish to <code>iot/&lt;device_id&gt;/telemetry</code>:</p>' +
+      '<code>curl -X POST /api/webhook/data -H \'Content-Type: application/json\' \\<br />&nbsp;&nbsp;-d \'{"device_id":"ESP32-101","sensor_name":"temperature","value":24.6,"unit":"C"}\'</code>' +
+      '<p class="empty-state-hint">No hardware yet? <code>npm run simulate</code> registers a virtual fleet the same way real nodes do.</p>';
+    return el;
   }
 
   /** In-place patch of one card — no page re-render for a telemetry frame. */
@@ -417,8 +411,6 @@
     if (seen) seen.textContent = updatedLabel(device);
     const ip = card.querySelector('[data-role="ip"]');
     if (ip) ip.textContent = device.ip || '—';
-    const mac = card.querySelector('[data-role="mac"]');
-    if (mac) mac.textContent = device.mac || '—';
 
     const sensor = primarySensor(device);
     const primary = sensor ? (device.metrics || {})[sensor] : null;
@@ -437,20 +429,6 @@
       }
     }
     if (unit && primary && primary.unit) unit.textContent = primary.unit;
-
-    const secondary = card.querySelector('[data-role="secondary"]');
-    if (secondary) {
-      secondary.textContent = Object.entries(device.metrics || {})
-        .filter(([name]) => name !== sensor)
-        .slice(0, 3)
-        .map(([name, metric]) => `${name} ${fmtNumber(metric.value)}${metric.unit ? ` ${metric.unit}` : ''}`)
-        .join(' · ');
-    }
-
-    const tags = card.querySelector('[data-role="config-tags"]');
-    if (tags) tags.innerHTML = configTags(device);
-    const rev = card.querySelector('[data-role="config-rev"]');
-    if (rev) rev.textContent = device.config_revision ? `rev ${device.config_revision}` : '';
 
     if (flash) flashCard(card);
   }
@@ -783,7 +761,7 @@
         (command) => `<tr data-command="${command.id}">
           <td class="px-2 py-1 text-[#47605a]">${command.id}</td>
           <td class="max-w-[14rem] truncate px-2 py-1 text-[#9fd8b4]" title="${esc(command.payload)}">${esc(String(command.payload).slice(0, 60))}</td>
-          <td class="px-2 py-1"><span class="badge px-1.5 py-0 text-[0.55rem] ${STATUS_STYLES[command.status] || ''}">${esc(command.status)}</span></td>
+          <td class="px-2 py-1"><span class="badge px-1.5 py-0 text-sm ${STATUS_STYLES[command.status] || ''}">${esc(command.status)}</span></td>
         </tr>`,
       )
       .join('');
@@ -891,7 +869,7 @@
         if (type === 'checkbox') {
           return `<div class="cfg-row" data-key="${esc(key)}">
             <input class="cfg-key" value="${esc(key)}" spellcheck="false" />
-            <label class="flex items-center gap-2 text-[0.68rem] text-[#9fd8b4]">
+            <label class="flex items-center gap-2 text-base text-[#9fd8b4]">
               <input type="checkbox" class="cfg-val accent-[#39FF14]" data-type="boolean" ${value ? 'checked' : ''} />
               <span>${value ? 'true' : 'false'}</span>
             </label>
@@ -905,7 +883,7 @@
           <button class="cfg-del" data-cfg-del type="button" title="Remove">✕</button>
         </div>`;
       })
-      .join('') || '<p class="text-[0.66rem] text-[#47605a]">no fields — use + ADD FIELD or edit the raw JSON.</p>';
+      .join('') || '<p class="text-sm text-[#47605a]">no fields — use + ADD FIELD or edit the raw JSON.</p>';
   }
 
   /** Form rows are the source of truth when they change. */
@@ -1108,7 +1086,7 @@
       .map(
         (card) => `<div class="stat-card">
           <p class="label mb-0">${esc(card.label)}</p>
-          <p class="${card.small ? 'truncate text-[0.72rem]' : 'text-lg'} font-bold ${
+          <p class="${card.small ? 'truncate text-base' : 'text-lg'} font-bold ${
             card.label === 'Failed' && Number(card.value) > 0 ? 'text-[#ffb3ad]' : 'text-neon'
           }" title="${esc(String(card.value))}">${esc(String(card.value))}</p>
         </div>`,
@@ -1130,7 +1108,7 @@
           <td class="px-2 py-1 text-[#9fd8b4]"><button type="button" class="hover:text-neon" data-open-device="${esc(log.device_id || '')}">${esc(
             log.device_id || '—',
           )}</button></td>
-          <td class="px-2 py-1"><span class="badge px-1.5 py-0 text-[0.55rem] ${
+          <td class="px-2 py-1"><span class="badge px-1.5 py-0 text-sm ${
             log.status === 'success' ? 'text-neon border-[rgba(57,255,20,0.45)]' : 'text-[#ffb3ad] border-[rgba(255,59,48,0.5)]'
           }">${esc(log.status)}</span></td>
           <td class="px-2 py-1 text-[#6d8b84]">${log.http_status ?? '—'}</td>
@@ -1220,7 +1198,7 @@
 
     const list = $('rules-list');
     if (!state.rules.length) {
-      list.innerHTML = '<p class="text-[0.68rem] text-[#47605a]">No rules yet — add one below.</p>';
+      list.innerHTML = '<p class="text-base text-[#47605a]">No rules yet — add one below.</p>';
       return;
     }
     list.innerHTML = state.rules
@@ -1230,18 +1208,18 @@
           <button class="switch mt-0.5" role="switch" aria-checked="${rule.enabled ? 'true' : 'false'}"
                   data-rule-toggle="${rule.id}" aria-label="Toggle rule ${esc(rule.name)}"></button>
           <div class="min-w-0 flex-1">
-            <p class="truncate text-[0.7rem] text-[#d9ffcf]" title="${esc(rule.name)}">${esc(rule.name)}</p>
-            <p class="mt-0.5 text-[0.62rem] text-[#6d8b84]">
+            <p class="truncate text-base text-[#d9ffcf]" title="${esc(rule.name)}">${esc(rule.name)}</p>
+            <p class="mt-0.5 text-sm text-[#6d8b84]">
               IF <span class="text-neon">${esc(rule.sensor_name)}</span> ${esc(rule.operator)}
               <span class="text-neon">${esc(fmtNumber(rule.threshold))}</span>
               → <span class="text-[#eaff6b]">${esc(rule.action)}</span>
             </p>
-            <p class="mt-0.5 text-[0.58rem] text-[#47605a]">
+            <p class="mt-0.5 text-sm text-[#47605a]">
               ${esc(rule.device_id === '*' ? 'all devices' : rule.device_id)} · cooldown ${rule.cooldown_seconds}s ·
               fired ${rule.trigger_count}× ${rule.last_triggered ? `· last ${esc(relTime(rule.last_triggered))}` : ''}
             </p>
           </div>
-          <button class="btn btn-danger px-1.5 py-0.5 text-[0.55rem]" data-rule-delete="${rule.id}" type="button">DEL</button>
+          <button class="btn btn-danger px-1.5 py-0.5 text-sm" data-rule-delete="${rule.id}" type="button">DEL</button>
         </div>
       </div>`,
       )
@@ -1278,7 +1256,7 @@
       )}">${esc(command.device_id)}</button></td>
       <td class="max-w-[16rem] truncate px-2 py-1 text-[#6d8b84]" title="${esc(command.payload)}">${esc(String(command.payload).slice(0, 72))}</td>
       <td class="px-2 py-1 text-[#7dd3fc]">${esc(command.source)}</td>
-      <td class="px-2 py-1"><span class="badge px-1.5 py-0 text-[0.55rem] ${STATUS_STYLES[command.status] || ''}">${esc(
+      <td class="px-2 py-1"><span class="badge px-1.5 py-0 text-sm ${STATUS_STYLES[command.status] || ''}">${esc(
         command.status,
       )}</span></td>
     </tr>`;
