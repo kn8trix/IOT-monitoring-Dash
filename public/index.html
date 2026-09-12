@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en" class="h-full">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#06090B" />
+    <meta name="description" content="IOT // DASHBOARD — real-time monitoring and control for 200+ MQTT/webhook devices" />
+    <title>IOT // DASHBOARD</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2306090B'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%2339FF14'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/css/app.css" />
+  </head>
+
+  <body class="min-h-full antialiased">
+    <!-- ============================== HEADER ============================== -->
+    <header class="sticky top-0 z-30 border-b border-edge bg-void/95 backdrop-blur">
+      <div class="mx-auto flex max-w-[1800px] flex-wrap items-center gap-x-5 gap-y-2 px-3 py-2.5 sm:px-5">
+        <h1 class="neon-title glow-text text-base font-bold tracking-[0.22em] text-neon sm:text-xl">
+          IOT&nbsp;//&nbsp;DASHBOARD
+        </h1>
+
+        <div class="badge" title="Server + Socket.io link">
+          <span id="status-dot" class="dot dot-online"></span>
+          <span class="text-[0.62rem] text-[#8fb39b]">SYSTEM STATUS:</span>
+          <span id="status-label" class="text-neon glow-text-soft">ACTIVE</span>
+        </div>
+
+        <div class="badge" title="MQTT broker connection">
+          <span id="mqtt-dot" class="dot dot-offline"></span>
+          <span class="text-[#8fb39b]">MQTT:</span>
+          <span id="mqtt-label" class="text-[#6d8b84]">CONNECTING</span>
+        </div>
+
+        <div class="hidden items-center gap-4 sm:flex">
+          <span class="badge">
+            <span class="text-[#8fb39b]">NODES:</span>
+            <span id="header-online" class="text-neon">0</span>
+            <span class="text-[#47605a]">/</span>
+            <span id="header-total" class="text-[#8fb39b]">0</span>
+          </span>
+          <span class="badge">
+            <span class="text-[#8fb39b]">IN/MIN:</span>
+            <span id="header-rate" class="text-neon">0</span>
+          </span>
+          <span class="badge" title="Dashboard clients connected">
+            <span class="text-[#8fb39b]">CLIENTS:</span>
+            <span id="header-clients" class="text-neon">0</span>
+          </span>
+        </div>
+
+        <div class="ml-auto flex items-center gap-3">
+          <span id="socket-badge" class="badge border-edge text-[#8fb39b]">
+            <span id="socket-dot" class="dot dot-online"></span>
+            <span id="socket-label">LINK: LIVE</span>
+          </span>
+          <time id="clock" class="hidden font-mono text-xs text-neon glow-text-soft md:inline">--:--:--</time>
+        </div>
+      </div>
+    </header>
+
+    <main class="mx-auto max-w-[1800px] px-3 pb-[380px] pt-4 sm:px-5">
+      <!-- ============================ STATS ============================ -->
+      <section id="stats-strip" class="grid grid-cols-2 gap-2.5 sm:grid-cols-4 xl:grid-cols-8">
+        <div class="stat-card">
+          <p class="label mb-0">Devices</p>
+          <p id="stat-total" class="text-xl font-bold text-neon glow-text-soft">0</p>
+        </div>
+        <div class="stat-card">
+          <p class="label mb-0">Online</p>
+          <p id="stat-online" class="text-xl font-bold text-neon glow-text-soft">0</p>
+        </div>
+        <div class="stat-card">
+          <p class="label mb-0">Offline</p>
+          <p id="stat-offline" class="text-xl font-bold text-[#6d8b84]">0</p>
+        </div>
+        <div class="stat-card">
+          <p class="label mb-0">Readings / min</p>
+          <p id="stat-rate" class="text-xl font-bold text-neon glow-text-soft">0</p>
+        </div>
+        <div class="stat-card">
+          <p class="label mb-0">Telemetry rows</p>
+          <p id="stat-rows" class="text-xl font-bold text-[#9fd8b4]">0</p>
+        </div>
+        <div class="stat-card">
+          <p class="label mb-0">Queued cmds</p>
+          <p id="stat-pending" class="text-xl font-bold text-[#eaff6b]">0</p>
+        </div>
+        <div class="stat-card">
+          <p class="label mb-0">Active rules</p>
+          <p id="stat-rules" class="text-xl font-bold text-neon glow-text-soft">0</p>
+        </div>
+        <div class="stat-card">
+          <p class="label mb-0">Uptime</p>
+          <p id="stat-uptime" class="text-xl font-bold text-[#22d3ee]">0s</p>
+        </div>
+      </section>
+
+      <div class="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-12">
+        <!-- ========================= LEFT COLUMN ========================= -->
+        <div class="flex flex-col gap-4 xl:col-span-8">
+          <!-- Chart ------------------------------------------------------ -->
+          <section class="panel">
+            <header class="panel-header flex flex-wrap items-center gap-x-3 gap-y-2 rounded-t-xl px-3.5 py-2.5">
+              <h2 class="glow-text-soft text-xs font-bold tracking-[0.18em] text-neon">REAL-TIME TELEMETRY</h2>
+              <span id="chart-current" class="badge border-[rgba(57,255,20,0.45)] text-neon glow-text-soft">--</span>
+              <div class="ml-auto flex flex-wrap items-center gap-2">
+                <select id="chart-device" class="select w-[10.5rem]" aria-label="Chart device"></select>
+                <select id="chart-sensor" class="select w-[9.5rem]" aria-label="Chart sensor"></select>
+                <select id="chart-range" class="select w-[7.5rem]" aria-label="Chart time range">
+                  <option value="300000">LAST 5 MIN</option>
+                  <option value="900000" selected>LAST 15 MIN</option>
+                  <option value="3600000">LAST 1 H</option>
+                  <option value="21600000">LAST 6 H</option>
+                  <option value="86400000">LAST 24 H</option>
+                </select>
+                <button id="chart-live" class="btn btn-active" type="button" title="Follow the newest sample">● LIVE</button>
+              </div>
+            </header>
+
+            <div class="flex flex-wrap items-center gap-4 border-b border-edge px-3.5 py-2 text-[0.66rem] text-[#6d8b84]">
+              <span>MIN <b id="chart-min" class="text-neon">--</b></span>
+              <span>MAX <b id="chart-max" class="text-neon">--</b></span>
+              <span>AVG <b id="chart-avg" class="text-neon">--</b></span>
+              <span>SAMPLES <b id="chart-count" class="text-neon">0</b></span>
+              <span id="chart-range-label" class="ml-auto"></span>
+            </div>
+
+            <div class="p-3">
+              <div class="relative h-[260px] w-full">
+                <canvas id="telemetry-chart" aria-label="Real-time telemetry chart"></canvas>
+              </div>
+            </div>
+          </section>
+
+          <!-- Device grid ----------------------------------------------- -->
+          <section class="panel">
+            <header class="panel-header flex flex-wrap items-center gap-x-3 gap-y-2 rounded-t-xl px-3.5 py-2.5">
+              <h2 class="glow-text-soft text-xs font-bold tracking-[0.18em] text-neon">DEVICE GRID</h2>
+              <span id="device-count" class="badge text-[#8fb39b]">0 SHOWN</span>
+              <div class="ml-auto flex flex-wrap items-center gap-2">
+                <input id="device-search" class="input w-[12rem]" type="search" placeholder="search id / ip / name…" aria-label="Search devices" />
+                <div class="flex overflow-hidden rounded-lg border border-edge">
+                  <button class="btn rounded-none border-0 btn-active" data-status-filter="all" type="button">ALL</button>
+                  <button class="btn rounded-none border-0" data-status-filter="online" type="button">ONLINE</button>
+                  <button class="btn rounded-none border-0" data-status-filter="offline" type="button">OFFLINE</button>
+                </div>
+                <select id="device-sort" class="select w-[8.5rem]" aria-label="Sort devices">
+                  <option value="status">STATUS</option>
+                  <option value="id">DEVICE ID</option>
+                  <option value="location">LOCATION</option>
+                  <option value="seen">LAST SEEN</option>
+                </select>
+              </div>
+            </header>
+
+            <div id="device-grid" class="grid grid-cols-1 gap-2.5 p-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4"></div>
+
+            <div class="flex items-center justify-center gap-3 border-t border-edge px-3.5 py-2.5">
+              <span id="device-grid-note" class="text-[0.66rem] text-[#6d8b84]"></span>
+              <button id="device-more" class="btn hidden" type="button">LOAD MORE</button>
+            </div>
+          </section>
+        </div>
+
+        <!-- ========================= RIGHT COLUMN ========================= -->
+        <div class="flex flex-col gap-4 xl:col-span-4">
+          <!-- Control panel --------------------------------------------- -->
+          <section class="panel">
+            <header class="panel-header rounded-t-xl px-3.5 py-2.5">
+              <h2 class="glow-text-soft text-xs font-bold tracking-[0.18em] text-neon">CONTROL PANEL</h2>
+            </header>
+
+            <form id="command-form" class="space-y-2.5 p-3.5">
+              <div>
+                <label class="label" for="cmd-device">Target device id</label>
+                <div class="flex gap-2">
+                  <input id="cmd-device" class="input" list="device-options" placeholder="ESP32-0001" autocomplete="off" />
+                  <button id="cmd-use-selected" class="btn" type="button" title="Use the device selected in the grid">USE</button>
+                </div>
+                <datalist id="device-options"></datalist>
+                <p id="cmd-target-hint" class="mt-1 text-[0.62rem] text-[#47605a]">No device selected — click a device card.</p>
+              </div>
+
+              <div>
+                <div class="mb-1 flex items-center justify-between">
+                  <label class="label mb-0" for="cmd-payload">Command payload</label>
+                  <div class="flex gap-1">
+                    <button class="btn px-2 py-0.5 text-[0.6rem] btn-active" data-cmd-mode="text" type="button">TEXT</button>
+                    <button class="btn px-2 py-0.5 text-[0.6rem]" data-cmd-mode="json" type="button">JSON</button>
+                  </div>
+                </div>
+                <textarea id="cmd-payload" class="textarea h-[92px] resize-y" spellcheck="false"
+                  placeholder='{&#10;  "action": "RELAY_ON",&#10;  "duration_ms": 5000&#10;}'></textarea>
+                <p id="cmd-payload-hint" class="mt-1 text-[0.62rem] text-[#47605a]">Text mode sends the payload verbatim.</p>
+              </div>
+
+              <div class="flex flex-wrap gap-1.5">
+                <button class="btn px-2 py-0.5 text-[0.6rem]" data-quick-command="RELAY_ON" type="button">RELAY_ON</button>
+                <button class="btn px-2 py-0.5 text-[0.6rem]" data-quick-command="RELAY_OFF" type="button">RELAY_OFF</button>
+                <button class="btn px-2 py-0.5 text-[0.6rem]" data-quick-command="STATUS" type="button">STATUS</button>
+                <button class="btn px-2 py-0.5 text-[0.6rem]" data-quick-command="CALIBRATE" type="button">CALIBRATE</button>
+                <button class="btn px-2 py-0.5 text-[0.6rem]" data-quick-command="REBOOT" type="button">REBOOT</button>
+                <button class="btn px-2 py-0.5 text-[0.6rem]" data-quick-command="OTA_UPDATE" type="button">OTA_UPDATE</button>
+              </div>
+
+              <button id="cmd-send" type="submit"
+                class="btn btn-neon w-full py-2.5 text-sm tracking-[0.2em]">
+                ▶ SEND COMMAND
+              </button>
+              <p id="cmd-result" class="min-h-[1rem] text-[0.68rem] text-[#6d8b84]"></p>
+            </form>
+          </section>
+
+          <!-- Automation ------------------------------------------------ -->
+          <section class="panel">
+            <header class="panel-header flex items-center gap-2 rounded-t-xl px-3.5 py-2.5">
+              <h2 class="glow-text-soft text-xs font-bold tracking-[0.18em] text-neon">AUTOMATION</h2>
+              <span id="rules-count" class="badge text-[#8fb39b]">0 RULES</span>
+              <button id="rules-refresh" class="btn ml-auto px-2 py-0.5 text-[0.6rem]" type="button">REFRESH</button>
+            </header>
+
+            <div id="rules-list" class="max-h-[260px] space-y-2 overflow-y-auto p-3"></div>
+
+            <form id="rule-form" class="space-y-2.5 border-t border-edge p-3.5">
+              <p class="label mb-0">New rule — if <span class="text-neon">sensor</span> crosses threshold</p>
+              <div class="grid grid-cols-2 gap-2">
+                <div class="col-span-2">
+                  <label class="label" for="rule-name">Rule name</label>
+                  <input id="rule-name" class="input" placeholder="If temp &gt; 30 trigger RELAY_OFF" />
+                </div>
+                <div>
+                  <label class="label" for="rule-sensor">Sensor</label>
+                  <input id="rule-sensor" class="input" list="sensor-options" placeholder="temperature" />
+                  <datalist id="sensor-options"></datalist>
+                </div>
+                <div>
+                  <label class="label" for="rule-operator">Operator</label>
+                  <select id="rule-operator" class="select">
+                    <option>&gt;</option>
+                    <option>&gt;=</option>
+                    <option>&lt;</option>
+                    <option>&lt;=</option>
+                    <option>==</option>
+                    <option>!=</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="label" for="rule-threshold">Threshold</label>
+                  <input id="rule-threshold" class="input" type="number" step="any" value="30" />
+                </div>
+                <div>
+                  <label class="label" for="rule-cooldown">Cooldown (s)</label>
+                  <input id="rule-cooldown" class="input" type="number" min="0" value="60" />
+                </div>
+                <div>
+                  <label class="label" for="rule-action">Action</label>
+                  <input id="rule-action" class="input" placeholder="RELAY_OFF" value="RELAY_OFF" />
+                </div>
+                <div>
+                  <label class="label" for="rule-device">Device (* = all)</label>
+                  <input id="rule-device" class="input" placeholder="*" value="*" />
+                </div>
+              </div>
+              <button class="btn btn-neon w-full py-2 text-xs tracking-[0.18em]" type="submit">
+                + ADD AUTOMATION RULE
+              </button>
+            </form>
+
+            <div class="border-t border-edge p-3.5">
+              <p class="label">Recent triggers</p>
+              <ul id="rule-events" class="space-y-1 text-[0.66rem] text-[#8fb39b]"></ul>
+            </div>
+          </section>
+
+          <!-- Command queue --------------------------------------------- -->
+          <section class="panel">
+            <header class="panel-header flex items-center gap-2 rounded-t-xl px-3.5 py-2.5">
+              <h2 class="glow-text-soft text-xs font-bold tracking-[0.18em] text-neon">COMMAND QUEUE</h2>
+              <span id="commands-count" class="badge text-[#8fb39b]">0</span>
+            </header>
+            <div class="max-h-[240px] overflow-y-auto p-3">
+              <table class="w-full text-left text-[0.66rem]">
+                <thead class="text-[#47605a]">
+                  <tr>
+                    <th class="pb-1">#</th>
+                    <th class="pb-1">DEVICE</th>
+                    <th class="pb-1">PAYLOAD</th>
+                    <th class="pb-1">STATUS</th>
+                  </tr>
+                </thead>
+                <tbody id="commands-list" class="align-top"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <!-- ============================= TERMINAL ============================= -->
+    <section class="fixed inset-x-0 bottom-0 z-20 px-3 pb-3 sm:px-5">
+      <div class="mx-auto max-w-[1800px]">
+        <div class="terminal">
+          <header class="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-edge px-3.5 py-2">
+            <h2 class="glow-text-soft text-xs font-bold tracking-[0.18em] text-neon">▚ LIVE TERMINAL</h2>
+            <span class="text-[0.62rem] text-[#47605a]">INCOMING WEBHOOKS → / → OUTGOING COMMANDS</span>
+            <div class="ml-auto flex items-center gap-2">
+              <span id="term-count" class="badge text-[#8fb39b]">0 LINES</span>
+              <button id="term-filter-toggle" class="btn px-2 py-0.5 text-[0.6rem]" type="button" title="Only show webhooks, commands and automations">FOCUS</button>
+              <button id="term-pause" class="btn px-2 py-0.5 text-[0.6rem]" type="button">PAUSE</button>
+              <button id="term-clear" class="btn px-2 py-0.5 text-[0.6rem]" type="button">CLEAR</button>
+            </div>
+          </header>
+          <div id="terminal" class="terminal-body scroll-shadow h-[278px] px-2.5 py-2 text-neon" role="log" aria-live="polite">
+            <div id="term-cursor-line" class="term-prompt">
+              <span class="text-[#47605a]">root@iot-dashboard:~$</span> <span class="term-cursor"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div id="toasts" class="fixed bottom-[330px] right-4 z-40 flex w-[19rem] flex-col gap-2"></div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/vendor/chart.umd.js"></script>
+    <script src="/js/app.js" defer></script>
+  </body>
+</html>

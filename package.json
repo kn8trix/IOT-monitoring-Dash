@@ -1,0 +1,46 @@
+{
+  "name": "iot-monitoring-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-ready IoT monitoring dashboard: Node.js + Express + Socket.io + SQLite + MQTT for 200+ devices",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "build": "npm run vendor && npm run build:css",
+    "build:css": "tailwindcss -i ./public/css/input.css -o ./public/css/app.css --minify",
+    "watch:css": "tailwindcss -i ./public/css/input.css -o ./public/css/app.css --watch",
+    "vendor": "node scripts/vendor.js",
+    "postinstall": "npm run vendor",
+    "simulate": "node scripts/simulator.js",
+    "simulate:mqtt": "node scripts/simulator.js --mqtt",
+    "seed": "node scripts/seed.js",
+    "db:reset": "node scripts/seed.js --reset",
+    "check": "node --check src/server.js && node --check public/js/app.js && node --check scripts/simulator.js"
+  },
+  "keywords": [
+    "iot",
+    "mqtt",
+    "dashboard",
+    "socket.io",
+    "sqlite",
+    "esp32"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "chart.js": "^4.5.1",
+    "compression": "^1.8.2",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "mqtt": "^5.15.2",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.3.3",
+    "tailwindcss": "^4.3.3"
+  }
+}

@@ -1,0 +1,87 @@
+# =============================================================================
+# IOT // DASHBOARD — full stack
+#
+#   docker compose up -d --build      start (or rebuild) everything
+#   docker compose logs -f node-server
+#   docker compose down               stop
+#   docker compose down -v            stop and drop broker volumes
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Node.js application: Express + Socket.io + SQLite + MQTT bridge
+  # ---------------------------------------------------------------------------
+  node-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NODE_VERSION: "22" # must satisfy better-sqlite3's engines (>=22)
+    image: iot-monitoring-dashboard:latest
+    container_name: iot-node-server
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOST: 0.0.0.0
+      # `mqtt-broker` resolves via the compose network.
+      MQTT_URL: mqtt://mqtt-broker:1883
+      MQTT_TELEMETRY_TOPIC: iot/+/telemetry
+      DB_PATH: /app/data/iot.db
+      # Register this many demo devices on an empty database (0 = none).
+      SEED_DEVICE_COUNT: "220"
+      # Seconds without telemetry before a device is flagged offline.
+      OFFLINE_AFTER_SECONDS: "120"
+      SWEEP_INTERVAL_SECONDS: "15"
+      TELEMETRY_RETENTION_DAYS: "14"
+    volumes:
+      # SQLite + WAL live on the host so data survives rebuilds.
+      # Keep this path on a Linux-native filesystem (ext4/xfs). exFAT/NTFS/SMB
+      # volumes can break SQLite locking — see HANDOVER.md → Troubleshooting.
+      - ./data:/app/data
+    depends_on:
+      mqtt-broker:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - iot-net
+
+  # ---------------------------------------------------------------------------
+  # Eclipse Mosquitto — MQTT broker (TCP 1883 + WebSockets 9001)
+  # ---------------------------------------------------------------------------
+  mqtt-broker:
+    image: eclipse-mosquitto:2
+    container_name: iot-mqtt-broker
+    restart: unless-stopped
+    ports:
+      - "1883:1883" # MQTT (devices, backend, esp32)
+      - "9001:9001" # MQTT over WebSockets (browser dashboards)
+    volumes:
+      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      # Named volumes: Docker handles ownership/permissions correctly, which
+      # bind mounts onto external/exFAT drives often do not.
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h 127.0.0.1 -p 1883 -t '$$SYS/#' -C 1 -W 3 > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - iot-net
+
+networks:
+  iot-net:
+    driver: bridge
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:
