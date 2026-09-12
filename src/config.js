@@ -50,7 +50,9 @@ const config = {
   },
 
   device: {
-    offlineAfterSeconds: toInt(process.env.OFFLINE_AFTER_SECONDS, 120),
+    // Heartbeat window: a node is ONLINE while its last ping is younger than
+    // this. The dashboard applies the same rule client-side (HEARTBEAT_MS).
+    offlineAfterSeconds: toInt(process.env.OFFLINE_AFTER_SECONDS, 30),
     sweepIntervalSeconds: toInt(process.env.SWEEP_INTERVAL_SECONDS, 15),
   },
 

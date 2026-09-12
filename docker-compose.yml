@@ -32,8 +32,9 @@ services:
       DB_PATH: /app/data/iot.db
       # Register this many demo devices on an empty database (0 = none).
       SEED_DEVICE_COUNT: "220"
-      # Seconds without telemetry before a device is flagged offline.
-      OFFLINE_AFTER_SECONDS: "120"
+      # Heartbeat window: seconds without telemetry before a device is flagged
+      # offline (the dashboard cards use the same 30 s rule).
+      OFFLINE_AFTER_SECONDS: "30"
       SWEEP_INTERVAL_SECONDS: "15"
       TELEMETRY_RETENTION_DAYS: "14"
     volumes:

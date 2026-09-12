@@ -85,6 +85,12 @@ const args = parseArgs(process.argv);
 
 const LOCATIONS = ['Plant A', 'Plant B', 'Warehouse', 'Server Room', 'Greenhouse', 'Cold Storage', 'Roof Deck'];
 
+/** Deterministic demo MAC mirroring src/db.js (`seedMac`). */
+function deviceMac(index) {
+  const hex = (value) => (value & 0xff).toString(16).toUpperCase().padStart(2, '0');
+  return `A4:CF:12:${hex(index >> 16)}:${hex(index >> 8)}:${hex(index)}`;
+}
+
 function buildFleet(count, prefix) {
   const fleet = [];
   for (let i = 1; i <= count; i += 1) {
@@ -92,6 +98,7 @@ function buildFleet(count, prefix) {
     fleet.push({
       device_id: `${prefix}${String(i).padStart(4, '0')}`,
       ip: `10.${Math.floor((i - 1) / 254) % 99 + 1}.${((i - 1) % 254) + 1}.10`,
+      mac: deviceMac(i),
       name: `Sensor Node ${i}`,
       location: LOCATIONS[(i - 1) % LOCATIONS.length],
       firmware: `v1.${(i - 1) % 5}.${i % 9}`,
@@ -150,6 +157,7 @@ async function sendHttp(device, readings) {
     body: JSON.stringify({
       device_id: device.device_id,
       ip: device.ip,
+      mac: device.mac,
       name: device.name,
       location: device.location,
       firmware: device.firmware,

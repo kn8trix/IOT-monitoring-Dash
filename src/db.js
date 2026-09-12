@@ -10,6 +10,10 @@
  *   commands          command queue, HTTP-pollable, mirrored to MQTT
  *   automation_rules  "if sensor > threshold then action" rules
  *   rule_events       audit trail of every automation trigger
+ *
+ * Schema versions
+ *   1  initial build
+ *   2  devices.mac (shown on the dashboard device cards)
  */
 
 const fs = require('fs');
@@ -19,7 +23,7 @@ const Database = require('better-sqlite3');
 const config = require('./config');
 const { bus, log } = require('./events');
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 let db = null;
 let stmts = {};
@@ -33,6 +37,7 @@ CREATE TABLE IF NOT EXISTS devices (
   device_id     TEXT PRIMARY KEY,
   name          TEXT,
   ip            TEXT,
+  mac           TEXT,
   location      TEXT,
   firmware      TEXT,
   status        TEXT    NOT NULL DEFAULT 'offline',
@@ -155,17 +160,31 @@ function init() {
   db.pragma('temp_store = MEMORY');
 
   db.exec(DDL);
-
-  const version = db.pragma('user_version', { simple: true });
-  if (version !== SCHEMA_VERSION) {
-    // Migrations are additive; the DDL above is idempotent.
-    db.pragma(`user_version = ${SCHEMA_VERSION}`);
-  }
-
+  migrate();
   prepare();
   migrateDevicesToOffline();
   log('info', 'DB', `SQLite ready at ${config.db.path} (schema v${SCHEMA_VERSION})`);
   return db;
+}
+
+/**
+ * Additive migrations for databases created by an older release.
+ * `CREATE TABLE IF NOT EXISTS` never alters an existing table, so column
+ * additions are applied explicitly here.
+ */
+function migrate() {
+  const version = db.pragma('user_version', { simple: true });
+  const columns = new Set(db.prepare('PRAGMA table_info(devices)').all().map((row) => row.name));
+
+  if (!columns.has('mac')) {
+    db.exec('ALTER TABLE devices ADD COLUMN mac TEXT');
+    log('info', 'DB', 'migration applied: devices.mac (schema v2)');
+  }
+
+  if (version !== SCHEMA_VERSION) {
+    db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    log('info', 'DB', `schema version ${version} -> ${SCHEMA_VERSION}`);
+  }
 }
 
 /** A restart means we lost contact with everything: re-arm liveness. */
@@ -191,8 +210,8 @@ function close() {
 function prepare() {
   stmts = {
     insertDevice: db.prepare(`
-      INSERT INTO devices (device_id, name, ip, location, firmware, status, last_seen, last_payload, first_seen, updated_at)
-      VALUES (@device_id, @name, @ip, @location, @firmware, 'online', @ts, @last_payload, @ts, @ts)
+      INSERT INTO devices (device_id, name, ip, mac, location, firmware, status, last_seen, last_payload, first_seen, updated_at)
+      VALUES (@device_id, @name, @ip, @mac, @location, @firmware, 'online', @ts, @last_payload, @ts, @ts)
       ON CONFLICT(device_id) DO NOTHING
     `),
     touchDevice: db.prepare(`
@@ -201,6 +220,7 @@ function prepare() {
              last_seen = @ts,
              updated_at = @ts,
              ip = COALESCE(@ip, ip),
+             mac = COALESCE(@mac, mac),
              name = COALESCE(@name, name),
              firmware = COALESCE(@firmware, firmware),
              location = COALESCE(@location, location),
@@ -211,14 +231,16 @@ function prepare() {
     listDevices: db.prepare(`SELECT * FROM devices ORDER BY device_id ASC LIMIT ? OFFSET ?`),
     listDevicesFiltered: db.prepare(`
       SELECT * FROM devices
-       WHERE (device_id LIKE @q OR IFNULL(name,'') LIKE @q OR IFNULL(ip,'') LIKE @q OR IFNULL(location,'') LIKE @q)
+       WHERE (device_id LIKE @q OR IFNULL(name,'') LIKE @q OR IFNULL(ip,'') LIKE @q
+              OR IFNULL(mac,'') LIKE @q OR IFNULL(location,'') LIKE @q)
        ORDER BY CASE status WHEN 'online' THEN 0 ELSE 1 END, last_seen DESC, device_id ASC
        LIMIT @limit OFFSET @offset
     `),
     countDevices: db.prepare(`SELECT COUNT(*) AS c FROM devices`),
     countDevicesFiltered: db.prepare(`
       SELECT COUNT(*) AS c FROM devices
-       WHERE (device_id LIKE @q OR IFNULL(name,'') LIKE @q OR IFNULL(ip,'') LIKE @q OR IFNULL(location,'') LIKE @q)
+       WHERE (device_id LIKE @q OR IFNULL(name,'') LIKE @q OR IFNULL(ip,'') LIKE @q
+              OR IFNULL(mac,'') LIKE @q OR IFNULL(location,'') LIKE @q)
     `),
     setStatus: db.prepare(`UPDATE devices SET status = ?, updated_at = ? WHERE device_id = ? AND status <> ?`),
     offlineDevices: db.prepare(`
@@ -255,6 +277,21 @@ function prepare() {
     recentTelemetry: db.prepare(`
       SELECT id, device_id, sensor_name, value, unit, created_at
         FROM telemetry ORDER BY id DESC LIMIT ?
+    `),
+    // Last N samples per (device, sensor) — feeds the device-card sparklines.
+    // Bounded by time so a multi-million row table still answers in ticks.
+    recentSeries: db.prepare(`
+      SELECT device_id, sensor_name, value, created_at FROM (
+        SELECT device_id, sensor_name, value, created_at,
+               ROW_NUMBER() OVER (
+                 PARTITION BY device_id, sensor_name ORDER BY created_at DESC, id DESC
+               ) AS rn
+          FROM telemetry
+         WHERE created_at >= @since AND value IS NOT NULL
+      )
+       WHERE rn <= @points
+       ORDER BY device_id, sensor_name, created_at ASC
+       LIMIT @maxRows
     `),
     sensorsForDevice: db.prepare(`
       SELECT sensor_name, COUNT(*) AS samples, MAX(created_at) AS last_at
@@ -367,7 +404,7 @@ function prepare() {
  * Register or refresh a device. Emits `device` only when the row is new or the
  * liveness state actually flipped, so 200+ devices don't flood the socket.
  */
-function upsertDevice({ device_id, name, ip, location, firmware, last_payload } = {}) {
+function upsertDevice({ device_id, name, ip, mac, location, firmware, last_payload } = {}) {
   const id = String(device_id || '').trim();
   if (!id) return null;
 
@@ -377,6 +414,7 @@ function upsertDevice({ device_id, name, ip, location, firmware, last_payload } 
     device_id: id,
     name: name || null,
     ip: ip || null,
+    mac: mac ? String(mac).trim().slice(0, 32) : null,
     location: location || null,
     firmware: firmware || null,
     last_payload: last_payload ? String(last_payload).slice(0, 512) : null,
@@ -387,7 +425,7 @@ function upsertDevice({ device_id, name, ip, location, firmware, last_payload } 
     stmts.insertDevice.run(params);
     const device = stmts.getDevice.get(id);
     bus.emit('device', device);
-    log('success', 'DB', `device registered: ${id}${ip ? ` @ ${ip}` : ''}`);
+    log('success', 'DB', `device registered: ${id}${ip ? ` @ ${ip}` : ''}${mac ? ` [${mac}]` : ''}`);
     return device;
   }
 
@@ -424,10 +462,13 @@ function setStatus(deviceId, status) {
 }
 
 /**
- * Device list joined with its latest sensor readings.
- * @param {{ search?: string, limit?: number, offset?: number }} opts
+ * Device list joined with its latest sensor readings (and, optionally, the last
+ * N samples of every series so the dashboard cards can draw a sparkline).
+ *
+ * @param {{ search?: string, limit?: number, offset?: number,
+ *           sparkline?: boolean, sparklinePoints?: number }} opts
  */
-function listDevices({ search = '', limit = 500, offset = 0 } = {}) {
+function listDevices({ search = '', limit = 500, offset = 0, sparkline = false, sparklinePoints = 10 } = {}) {
   const safeLimit = Math.min(Math.max(Number(limit) || 500, 1), 2000);
   const safeOffset = Math.max(Number(offset) || 0, 0);
   const term = String(search || '').trim();
@@ -451,12 +492,39 @@ function listDevices({ search = '', limit = 500, offset = 0 } = {}) {
     };
   }
 
+  let series = null;
+  if (sparkline && rows.length) {
+    series = getRecentSeries({ points: sparklinePoints });
+  }
+
   const devices = rows.map((device) => ({
     ...device,
     metrics: byDevice.get(device.device_id) || {},
+    ...(series ? { sparkline: series.get(device.device_id) || {} } : {}),
   }));
 
   return { devices, total, limit: safeLimit, offset: safeOffset };
+}
+
+/**
+ * Latest samples per (device, sensor): `device_id -> sensor -> [{ts, value}]`.
+ * Only recent history is scanned so the query stays fast as `telemetry` grows.
+ */
+function getRecentSeries({ points = 10, sinceMs = 5 * 60 * 1000, maxRows = 20000 } = {}) {
+  const rows = stmts.recentSeries.all({
+    points: Math.min(Math.max(Number(points) || 10, 1), 200),
+    since: now() - Math.max(Number(sinceMs) || 0, 1000),
+    maxRows: Math.min(Math.max(Number(maxRows) || 20000, 100), 200000),
+  });
+
+  const byDevice = new Map();
+  for (const row of rows) {
+    if (!byDevice.has(row.device_id)) byDevice.set(row.device_id, {});
+    const deviceSeries = byDevice.get(row.device_id);
+    if (!deviceSeries[row.sensor_name]) deviceSeries[row.sensor_name] = [];
+    deviceSeries[row.sensor_name].push({ ts: row.created_at, value: row.value });
+  }
+  return byDevice;
 }
 
 /** Flip devices that stopped reporting to `offline`. Returns affected count. */
@@ -481,7 +549,7 @@ function sweepOffline() {
  * Persist one sensor reading (and refresh the device + latest-value cache).
  * @returns {{ inserted: boolean, telemetry: object|null, device: object|null }}
  */
-function recordTelemetry({ device_id, sensor_name, value, unit, ip, name, location, firmware, created_at } = {}) {
+function recordTelemetry({ device_id, sensor_name, value, unit, ip, mac, name, location, firmware, created_at } = {}) {
   const id = String(device_id || '').trim();
   if (!id) return { inserted: false, telemetry: null, device: null };
 
@@ -492,6 +560,7 @@ function recordTelemetry({ device_id, sensor_name, value, unit, ip, name, locati
   const device = upsertDevice({
     device_id: id,
     ip,
+    mac,
     name,
     location,
     firmware,
@@ -847,6 +916,12 @@ const SENSOR_KITS = [
 
 const LOCATIONS = ['Plant A', 'Plant B', 'Warehouse', 'Server Room', 'Greenhouse', 'Cold Storage', 'Roof Deck'];
 
+/** Deterministic demo MAC (A4:CF:12 is a real Espressif OUI prefix). */
+function seedMac(index) {
+  const hex = (value, width = 2) => (value & 0xff).toString(16).toUpperCase().padStart(width, '0');
+  return `A4:CF:12:${hex(index >> 16)}:${hex(index >> 8)}:${hex(index)}`;
+}
+
 /**
  * Register `count` demo devices (used on first boot so a fresh install has a
  * populated grid). Idempotent: existing device ids are left untouched.
@@ -864,6 +939,7 @@ function seedDevices(count = config.seed.deviceCount) {
         device_id: id,
         name: `Sensor Node ${i}`,
         ip: `10.${(Math.floor((i - 1) / 254) % 99) + 1}.${((i - 1) % 254) + 1}.10`,
+        mac: seedMac(i),
         location: LOCATIONS[(i - 1) % LOCATIONS.length],
         firmware: `v1.${(i - 1) % 5}.${i % 9}`,
         last_payload: null,
@@ -919,6 +995,7 @@ module.exports = {
   getLatest,
   getSensors,
   recentTelemetry,
+  getRecentSeries,
   queueCommand,
   claimPendingCommands,
   markCommandDelivered,

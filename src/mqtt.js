@@ -110,7 +110,13 @@ function handleTelemetry(deviceId, payload) {
 function handleStatus(deviceId, payload) {
   const raw = typeof payload.status === 'string' ? payload.status : payload.online === false ? 'offline' : 'online';
   const status = ['online', 'offline'].includes(raw) ? raw : 'online';
-  db.upsertDevice({ device_id: deviceId, ip: payload.ip, name: payload.name, firmware: payload.firmware });
+  db.upsertDevice({
+    device_id: deviceId,
+    ip: payload.ip,
+    mac: payload.mac,
+    name: payload.name,
+    firmware: payload.firmware,
+  });
   db.setStatus(deviceId, status);
 }
 

@@ -134,26 +134,32 @@
 
           <!-- Device grid ----------------------------------------------- -->
           <section class="panel">
-            <header class="panel-header flex flex-wrap items-center gap-x-3 gap-y-2 rounded-t-xl px-3.5 py-2.5">
-              <h2 class="glow-text-soft text-xs font-bold tracking-[0.18em] text-neon">DEVICE GRID</h2>
-              <span id="device-count" class="badge text-[#8fb39b]">0 SHOWN</span>
-              <div class="ml-auto flex flex-wrap items-center gap-2">
-                <input id="device-search" class="input w-[12rem]" type="search" placeholder="search id / ip / name…" aria-label="Search devices" />
-                <div class="flex overflow-hidden rounded-lg border border-edge">
-                  <button class="btn rounded-none border-0 btn-active" data-status-filter="all" type="button">ALL</button>
-                  <button class="btn rounded-none border-0" data-status-filter="online" type="button">ONLINE</button>
-                  <button class="btn rounded-none border-0" data-status-filter="offline" type="button">OFFLINE</button>
+            <!-- Sticky search / filter / live-counter bar -->
+            <div class="sticky-bar panel-header rounded-t-xl px-3.5 py-2.5">
+              <div class="flex flex-wrap items-center gap-x-3 gap-y-2">
+                <h2 class="glow-text-soft text-xs font-bold tracking-[0.18em] text-neon">DEVICE GRID</h2>
+                <span id="device-count" class="badge text-[#8fb39b]" aria-live="polite" title="Devices matching the search">
+                  TOTAL: 0 | ONLINE: 0 | OFFLINE: 0
+                </span>
+                <div class="ml-auto flex flex-wrap items-center gap-2">
+                  <input id="device-search" class="input w-[13rem]" type="search"
+                         placeholder="search id / ip / mac…" aria-label="Search devices by id, ip or mac" />
+                  <div class="flex overflow-hidden rounded-lg border border-edge" role="group" aria-label="Filter by status">
+                    <button class="btn rounded-none border-0 btn-active" data-status-filter="all" type="button">ALL DEVICES</button>
+                    <button class="btn rounded-none border-0" data-status-filter="online" type="button">ONLINE ONLY</button>
+                    <button class="btn rounded-none border-0" data-status-filter="offline" type="button">OFFLINE ONLY</button>
+                  </div>
+                  <select id="device-sort" class="select w-[8.5rem]" aria-label="Sort devices">
+                    <option value="status">STATUS</option>
+                    <option value="id">DEVICE ID</option>
+                    <option value="location">LOCATION</option>
+                    <option value="seen">LAST SEEN</option>
+                  </select>
                 </div>
-                <select id="device-sort" class="select w-[8.5rem]" aria-label="Sort devices">
-                  <option value="status">STATUS</option>
-                  <option value="id">DEVICE ID</option>
-                  <option value="location">LOCATION</option>
-                  <option value="seen">LAST SEEN</option>
-                </select>
               </div>
-            </header>
+            </div>
 
-            <div id="device-grid" class="grid grid-cols-1 gap-2.5 p-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4"></div>
+            <div id="device-grid" class="grid grid-cols-1 gap-2.5 p-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4"></div>
 
             <div class="flex items-center justify-center gap-3 border-t border-edge px-3.5 py-2.5">
               <span id="device-grid-note" class="text-[0.66rem] text-[#6d8b84]"></span>
@@ -297,12 +303,16 @@
     </main>
 
     <!-- ============================= TERMINAL ============================= -->
-    <section class="fixed inset-x-0 bottom-0 z-20 px-3 pb-3 sm:px-5">
+    <section id="terminal-section" class="fixed inset-x-0 bottom-0 z-20 px-3 pb-3 sm:px-5">
       <div class="mx-auto max-w-[1800px]">
         <div class="terminal">
           <header class="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-edge px-3.5 py-2">
             <h2 class="glow-text-soft text-xs font-bold tracking-[0.18em] text-neon">▚ LIVE TERMINAL</h2>
             <span class="text-[0.62rem] text-[#47605a]">INCOMING WEBHOOKS → / → OUTGOING COMMANDS</span>
+            <span id="term-device-filter" class="badge hidden border-[rgba(57,255,20,0.5)] text-neon">
+              DEVICE: <b id="term-device-filter-label"></b>
+              <button id="term-device-filter-clear" class="ml-1 text-[#ffb3ad]" type="button" title="Stop filtering by device">✕</button>
+            </span>
             <div class="ml-auto flex items-center gap-2">
               <span id="term-count" class="badge text-[#8fb39b]">0 LINES</span>
               <button id="term-filter-toggle" class="btn px-2 py-0.5 text-[0.6rem]" type="button" title="Only show webhooks, commands and automations">FOCUS</button>

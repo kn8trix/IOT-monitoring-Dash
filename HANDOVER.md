@@ -131,7 +131,82 @@ rule takes exactly the same path — one place to debug, one place to log.
 
 Glow effects are `text-shadow`/`box-shadow` in `public/css/input.css`
 (`.glow-text`, `.glow-text-soft`, `.glow-border`, `.neon-title`, `.dot-online`
-pulse, `.term-cursor` blink).
+pulse, `.card-live-flash`, `.term-cursor` blink).
+
+### 3.1 Device-card monitoring grid
+
+Every registered device renders as a card (`public/js/app.js` → `cardInner()`),
+laid out `1 → 2 → 3 → 4` columns (mobile → sm → xl → 2xl).
+
+```
+┌──────────────────────────────────────────────┐
+│ Sensor Node 6              ◉ ONLINE          │  ← name + id, heartbeat badge
+│ ESP32-0006                                   │
+│ IP  10.1.6.10                                │  ← monospace metadata
+│ MAC A4:CF:12:00:00:06                        │
+│ ┌────────────┬────────────┬────────────┐     │
+│ │ HUMIDITY   │ PRESSURE   │ TEMPERATURE│     │  ← high-contrast stat blocks
+│ │ 51.2 %     │ 1,012.8 hPa│ 24.6 °C    │     │    (large bold neon green)
+│ └────────────┴────────────┴────────────┘     │
+│ ╱╲╱‾╲╱ sparkline (last 10 readings)          │  ← Chart.js mini-graph
+│ Updated 3 seconds ago        RELAY ON  v1.4.2│  ← last ping + relay state
+│ [ RELAY ON ][ RELAY OFF ][ LOGS ]            │  ← card quick actions
+└──────────────────────────────────────────────┘
+```
+
+**Status badge / heartbeat rule.** A card is `ONLINE` while its last ping is
+younger than **30 s** — the glowing neon-green dot pulses and the badge reads
+`ONLINE`; past that window it flips to a dim red dot and `OFFLINE`. The rule is
+applied in two places so the UI is never stale:
+
+| Where | Constant | Notes |
+| --- | --- | --- |
+| Browser | `HEARTBEAT_MS = 30_000` (`public/js/app.js`) | re-evaluated every 5 s, so a card drops to OFFLINE without waiting for the server |
+| Server | `OFFLINE_AFTER_SECONDS = 30` (`src/config.js`) | sweeper every 15 s emits `device_status` |
+
+Keep the two values in sync when changing either one.
+
+**Telemetry stat blocks.** The three highest-priority sensors of each node are
+rendered as stat blocks (`.metric-block`), value in large bold `#39FF14` with the
+unit as a small suffix. `primarySensor()` picks the sparkline series:
+`temperature` when present, otherwise the first sensor alphabetically.
+
+**Sparklines (Chart.js).** One line chart per card showing the last
+`MINI_POINTS = 10` readings, neon border + vertical gradient fill, no axes,
+animation off. Chart.js instances are expensive, so they are **created lazily and
+destroyed when scrolled out of view** (IntersectionObserver with a 120 px margin,
+`SPARKLINE_BUDGET = 32` concurrent instances max). The initial history comes from
+the server (`bootstrap.devices[].sparkline`, see §4 and §7); every subsequent
+frame is appended client-side from `telemetry_update`, so no server round-trip is
+needed per sample.
+
+**Quick actions** (buttons never steal the card's click-to-select behaviour):
+
+| Control | Effect |
+| --- | --- |
+| `RELAY ON` / `RELAY OFF` | `POST /api/webhook/command` with `{"action":"RELAY_ON","source":"quick-action"}`; the button shows a spinner, the relay pill switches to `RELAY ON/OFF`, and a toast reports whether it was published to MQTT or left queued for polling |
+| `LOGS` | scopes the live terminal to that device (`state.termDevice`); a chip appears in the terminal header (`DEVICE: ESP32-0006 ✕`) and only lines mentioning the device are shown |
+
+**Live updates without re-rendering.** When `telemetry_update` / `device_status`
+arrives the matching card is patched in place (`updateCard()`): metric values,
+sparkline (append + trim), last-ping label, IP/MAC/firmware and the badge. The
+card then runs a ~0.9 s neon border flash (`.card-live-flash`) as a visual
+"fresh data" cue — this is `box-shadow` only, so it never fights the
+`is-selected` / hover border colours. A full grid re-render only happens when the
+*composition* changes (a device enters/leaves the current filter or sort order),
+which is detected by comparing a device-id signature at most every 500 ms.
+
+**Sticky filter bar.** Search (device id / name / IP / MAC / location),
+`ALL DEVICES` / `ONLINE ONLY` / `OFFLINE ONLY` filters, sort, and the live census
+`TOTAL: X | ONLINE: Y | OFFLINE: Z`. The bar is `position: sticky` beneath the
+header; `--header-h` is published by a ResizeObserver so it stays aligned when the
+top bar wraps on narrow screens. The census always counts the search-scoped set
+(independent of the status filter), while the grid note shows
+`showing N of M matching`.
+
+Performance guards: `PAGE_SIZE = 24` cards per page ("LOAD MORE"), sparkline
+cards capped at 32, per-card patches instead of re-renders, and heartbeat
+repaints every 5 s touching only the visible cards.
 
 ### Typography
 
@@ -149,9 +224,10 @@ the dashboard renders identically on an offline LAN.
 3. **Real-time telemetry** — Chart.js line graph, neon `#39FF14` border with a
    vertical gradient fill, device/sensor/range selectors, `● LIVE` pause toggle,
    min/max/avg/sample readout.
-4. **Device grid** — responsive cards: device id, IP, location, firmware, pulsing
-   neon online dot, live metric chips, relative last-seen. Search, filter
-   (all/online/offline), sort, paginated "load more" (60 per page).
+4. **Device cards grid** — the monitoring surface (see §3.1): one rich card per
+   node with name + device id, heartbeat status badge, IP/MAC metadata, live
+   telemetry stat blocks, a Chart.js sparkline, last-ping label and quick
+   actions. Sticky search/filter/counter bar above it, paginated "load more".
 5. **Control panel** — target device id (with autocomplete), text/JSON payload
    mode with validation, quick-command chips, glowing `▶ SEND COMMAND` button.
 6. **Automation** — rule list with neon toggles, delete buttons, trigger counts,
@@ -170,9 +246,9 @@ the dashboard renders identically on an offline LAN.
 
 | Table | Purpose | Key columns |
 | --- | --- | --- |
-| `devices` | registered nodes + liveness | `device_id` PK, `name`, `ip`, `location`, `firmware`, `status` (`online`/`offline`), `last_seen`, `last_payload`, `first_seen`, `updated_at` |
+| `devices` | registered nodes + liveness | `device_id` PK, `name`, `ip`, `mac`, `location`, `firmware`, `status` (`online`/`offline`), `last_seen`, `last_payload`, `first_seen`, `updated_at` |
 | `telemetry` | append-only time series | `id` PK, `device_id`, `sensor_name`, `value` (REAL), `raw_value` (non-numeric), `unit`, `created_at` |
-| `latest_telemetry` | one row per device+sensor | PK `(device_id, sensor_name)` — O(1) device grid rendering |
+| `latest_telemetry` | one row per device+sensor | PK `(device_id, sensor_name)` — O(1) device-card metric rendering |
 | `commands` | command queue + audit | `id` PK, `device_id`, `payload`, `status`, `source`, `transport`, `mqtt_topic`, `created_at`, `delivered_at`, `acked_at`, `error` |
 | `automation_rules` | threshold rules | `id` PK, `name`, `device_id` (`*` = fleet-wide), `sensor_name`, `operator`, `threshold`, `action`, `action_payload`, `enabled`, `cooldown_seconds`, `last_triggered`, `trigger_count` |
 | `rule_events` | automation audit trail | `rule_id`, `device_id`, `sensor_name`, `value`, `operator`, `threshold`, `action`, `created_at` |
@@ -181,13 +257,28 @@ Indexes exist on `telemetry(device_id, sensor_name, created_at DESC)`,
 `telemetry(created_at DESC)`, `commands(device_id, status, id)`,
 `devices(status, last_seen DESC)`, `rule_events(created_at DESC)`.
 
-Schema version is tracked in `PRAGMA user_version` (currently `1`). Migrations are
-additive — `src/db.js` re-runs idempotent `CREATE TABLE IF NOT EXISTS` DDL on boot.
+Schema version is tracked in `PRAGMA user_version`:
 
-**Liveness:** a device is `online` while telemetry/status/poll traffic arrives.
-A sweeper runs every `SWEEP_INTERVAL_SECONDS` (15 s) and flips devices to
-`offline` when `last_seen` is older than `OFFLINE_AFTER_SECONDS` (120 s). On
-server restart all devices are re-armed to `offline` and re-appear as they report.
+| Version | Change |
+| --- | --- |
+| `1` | initial build |
+| `2` | `devices.mac` (rendered on the device cards) |
+
+Migrations are additive and run on boot in `src/db.js` → `migrate()`:
+`CREATE TABLE IF NOT EXISTS` never alters an existing table, so column additions
+are applied explicitly (`ALTER TABLE devices ADD COLUMN mac TEXT` when
+`PRAGMA table_info(devices)` lacks it) and both steps are logged:
+
+```
+[DB] migration applied: devices.mac (schema v2)
+[DB] schema version 1 -> 2
+```
+
+**Liveness (heartbeat):** a device is `online` while telemetry/status/poll traffic
+arrives. A sweeper runs every `SWEEP_INTERVAL_SECONDS` (15 s) and flips devices to
+`offline` when `last_seen` is older than `OFFLINE_AFTER_SECONDS` (**30 s**). The
+browser applies the same 30 s rule on the cards (see §3.1). On server restart all
+devices are re-armed to `offline` and re-appear as they report.
 
 ---
 
@@ -233,7 +324,7 @@ Rate limit: `RATE_LIMIT_MAX_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS` per IP
 
 | Method | Path | Body / query | Purpose |
 | --- | --- | --- | --- |
-| `POST` | `/api/webhook/data` | `{device_id, sensor_name, value, unit?}` — or `sensors{}`, `metrics{}`, `readings[]`; bare `text/plain` number allowed | ingest telemetry, upsert device, run automation |
+| `POST` | `/api/webhook/data` | `{device_id, sensor_name, value, unit?, mac?}` — or `sensors{}`, `metrics{}`, `readings[]`; bare `text/plain` number allowed | ingest telemetry, upsert device, run automation |
 | `POST` | `/api/webhook/command` | `{device_id, command}` or `{device_id, payload}` (plain text also accepted) | queue a command and publish it to MQTT |
 | `GET` | `/api/webhook/command/poll` | `?device_id=ESP32-0001&limit=20` | HTTP-polling devices collect pending commands (marks them `delivered`, refreshes liveness) |
 | `POST` | `/api/webhook/command/ack` | `{command_id, status:"acked"\|"failed", error?}` | device confirms execution |
@@ -245,7 +336,7 @@ Rate limit: `RATE_LIMIT_MAX_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS` per IP
 | `GET` | `/api/health` | service, version, uptime, MQTT state, ingest counters, automation stats |
 | `GET` | `/api/stats` | device/telemetry/command/rule counters + clients |
 | `GET` | `/api/mqtt/status` | broker connection detail, reconnects, last error |
-| `GET` | `/api/devices` | `?search=&limit=&offset=` — every device with latest metrics |
+| `GET` | `/api/devices` | `?search=&limit=&offset=&sparkline=&sparkline_points=` — every device with latest metrics; `search` also matches `mac`; `sparkline=true` adds the last N samples per sensor (off by default: ~45 ms / ~380 KB for a 1000-device fleet) |
 | `GET` | `/api/devices/:deviceId` | one device + metrics + sensors + recent commands |
 | `GET` | `/api/devices/:deviceId/telemetry` | `?sensor_name=temperature&limit=200&since_ms=3600000` — chart series |
 | `GET` | `/api/telemetry/recent` | `?limit=50` — newest rows across the fleet |
@@ -305,8 +396,10 @@ The ingest pipeline normalises whatever a firmware can realistically send:
 { "device": "ESP32-0001", "metric": "co2", "val": 780 }        // aliases accepted
 ```
 
-Optional metadata alongside any shape: `ip`, `name`, `location`, `firmware`,
-`unit`, `ts`/`timestamp` (epoch ms). Non-numeric values (`"OPEN"`, `"n/a"`) are
+Optional metadata alongside any shape: `ip`, `mac`, `name`, `location`,
+`firmware`, `unit`, `ts`/`timestamp` (epoch ms). `ip` and `mac` are only taken
+from the payload — never from the HTTP source address, which may be a proxy or
+NAT address and would overwrite good data. Non-numeric values (`"OPEN"`, `"n/a"`) are
 stored in `raw_value` for audit but are not charted and cannot trigger rules.
 Sensor names are normalised: lower-cased, spaces/odd characters → `_`, max 64 chars.
 
@@ -331,22 +424,92 @@ Automation commands are structured:
 ## 7. Socket.io events
 
 Client connects to the same origin (Socket.io client is served by the server at
-`/socket.io/socket.io.js`).
+`/socket.io/socket.io.js`). Everything the device grid needs arrives over this
+channel — the grid never polls REST.
 
 | Direction | Event | Payload |
 | --- | --- | --- |
-| S→C | `bootstrap` | full snapshot: stats, devices, rules, rule events, commands, recent telemetry, terminal backlog, MQTT state |
+| S→C | `bootstrap` | full snapshot on connect: `{stats, devices[], total_devices, rules[], rule_events[], commands[], recent_telemetry[], mqtt, ingest, terminal[], server_time, version}` |
 | S→C | `telemetry_update` | `{device_id, sensor_name, value, unit, created_at}` |
-| S→C | `device_update` | device row (registration / online / offline transition) |
+| S→C | `device_status` | device row — registration / online / offline transition |
+| S→C | `device_update` | identical payload to `device_status` (backwards-compatible alias, both are emitted) |
 | S→C | `command_sent` / `command_delivered` / `command_acked` | command row |
 | S→C | `rule_triggered` | `{rule, reading, command}` |
 | S→C | `rules_changed` | full rule list |
 | S→C | `stats` | counters + `clients`, every 5 s |
 | S→C | `mqtt_status` | broker state on change |
-| S→C | `terminal` | `{level, source, message, ts}` — the bottom console |
+| S→C | `terminal` | `{level, source, message, ts, meta?}` — the bottom console |
 | C→S | `request:snapshot` | ack callback receives a fresh snapshot |
 | C→S | `request:history` | `{device_id, sensor_name, limit, since_ms}` → ack with `points[]` |
-| C→S | `request:devices` | `{search}` → ack with the device list |
+| C→S | `request:devices` | `{search}` → ack with the device list (includes `sparkline`) |
+
+### 7.1 Payload structures the device grid consumes
+
+`bootstrap` → `devices[]` (each entry is a `devices` row plus live state):
+
+```json
+{
+  "device_id": "ESP32-0006",
+  "name": "Sensor Node 6",
+  "ip": "10.1.6.10",
+  "mac": "A4:CF:12:00:00:06",
+  "location": "Greenhouse",
+  "firmware": "v1.3.0",
+  "status": "online",
+  "last_seen": 1789196568081,
+  "metrics": {
+    "temperature": { "value": 24.63, "unit": "°C", "ts": 1789196568081 },
+    "humidity": { "value": 51.2, "unit": "%", "ts": 1789196568081 }
+  },
+  "sparkline": {
+    "temperature": [{ "ts": 1789196567081, "value": 24.31 }, "…up to 10 points…"],
+    "humidity": [{ "ts": 1789196567081, "value": 50.9 }]
+  }
+}
+```
+
+`telemetry_update` — one frame per sensor reading (also emitted for MQTT ingest):
+
+```json
+{ "device_id": "ESP32-0006", "sensor_name": "temperature", "value": 24.63, "unit": "°C", "created_at": 1789196568081 }
+```
+
+`device_status` / `device_update` — sent only when a row is new or the liveness
+state flips (so a 220-node fleet does not flood the socket):
+
+```json
+{ "device_id": "ESP32-0006", "name": "Sensor Node 6", "ip": "10.1.6.10", "mac": "A4:CF:12:00:00:06",
+  "location": "Greenhouse", "firmware": "v1.3.0", "status": "online", "last_seen": 1789196568081,
+  "last_payload": "{\"sensor\":\"temperature\",\"value\":24.63,\"unit\":\"°C\"}",
+  "first_seen": 1789196000000, "updated_at": 1789196568081 }
+```
+
+`command_sent` / `command_delivered` / `command_acked`:
+
+```json
+{ "id": 5, "device_id": "ESP32-0006", "payload": "{\"action\":\"RELAY_ON\",\"source\":\"quick-action\"}",
+  "status": "pending", "source": "ui", "transport": "mqtt", "mqtt_topic": "iot/ESP32-0006/command",
+  "created_at": 1789196568081, "delivered_at": null, "acked_at": null, "error": null }
+```
+
+`rule_triggered`:
+
+```json
+{ "rule": { "id": 1, "name": "Cool down when hot", "sensor_name": "temperature", "operator": ">",
+            "threshold": 30, "action": "RELAY_OFF", "device_id": "*", "trigger_count": 4 },
+  "reading": { "device_id": "ESP32-0008", "sensor_name": "temperature", "value": 51.97, "unit": "°C", "created_at": 1789196568272 },
+  "command": { "id": 6, "device_id": "ESP32-0008", "status": "pending", "source": "automation" } }
+```
+
+### 7.2 What each event updates on a card
+
+| Event | Card element patched |
+| --- | --- |
+| `telemetry_update` | metric stat block (`[data-metric]`) + its flash, sparkline append, `Updated …` label, heartbeat badge, then the card flash |
+| `device_status` / `device_update` | status dot + badge, IP/MAC/firmware, reorder/insertion (throttled grid reconciliation) |
+| `command_sent` / `…delivered` / `…acked` | relay pill state and the command-queue table |
+| `rule_triggered` | toast, recent-trigger list, `trigger_count`, and the queued command |
+| `terminal` | bottom console line (respects the per-device `LOGS` filter) |
 
 ---
 
@@ -725,7 +888,7 @@ values through `environment:` in `docker-compose.yml`.
 | `MQTT_TELEMETRY_TOPIC` | `iot/+/telemetry` | subscription |
 | `MQTT_COMMAND_TOPIC_TEMPLATE` | `iot/{device_id}/command` | publish topic |
 | `MQTT_TELEMETRY_ENABLED` | `true` | set `false` for webhook-only deployments |
-| `OFFLINE_AFTER_SECONDS` | `120` | silence before a node is marked offline |
+| `OFFLINE_AFTER_SECONDS` | `30` | heartbeat: silence before a node is marked offline. Keep in sync with `HEARTBEAT_MS` in `public/js/app.js` |
 | `SWEEP_INTERVAL_SECONDS` | `15` | liveness sweep cadence |
 | `TELEMETRY_RETENTION_DAYS` | `14` | hourly prune (`0` disables) |
 | `TELEMETRY_MAX_ROWS` | `2000000` | hard row cap, oldest trimmed first |
@@ -794,7 +957,16 @@ battery; CO₂; current) and random-walks around a realistic baseline.
 | Validation: missing `device_id`, illegal characters, unknown device, unknown route | ✅ 400/404 JSON |
 | Rate limiter / 404 handler / SPA fallback (no path traversal) | ✅ |
 | Simulator: 30 devices → 240 telemetry rows, 19 automation commands, 0 failures | ✅ |
-| `npm run build:css` → 24 kB minified stylesheet with all dynamic classes | ✅ |
+| Schema migration on a pre-existing v1 database (`user_version` 1 → 2, `devices.mac` added) | ✅ |
+| `mac` accepted from payloads, stored, shown on cards, and searchable via `?search=` | ✅ |
+| Sparkline history: per (device, sensor) series, capped at 10 points, 5-minute window bound | ✅ |
+| Sparkline cost at scale: 39,600-row window → 44.5 ms, 384 KB for 1000 devices (0.2 ms without) | ✅ |
+| Heartbeat 30 s served by `/api/health` (`offline_after_seconds`) and applied in the browser | ✅ |
+| Headless-Chrome UI run (real socket + Chart.js): 12/12 cards ONLINE, 12/12 sparkline charts initialised, MAC filled 12/12, census `TOTAL: 12 \| ONLINE: 12 \| OFFLINE: 0`, sticky bar, 46 terminal lines, 12 cards flashing live, **0 JS errors** | ✅ |
+| Card quick action → `RELAY_ON` for `ESP32-0006` persisted as `commands` row #5 `source=quick-action`, card pill switched to `RELAY ON` | ✅ |
+| Card `LOGS` action → terminal device-filter chip shows the device id and scopes the stream | ✅ |
+| Filter bar: search `ESP32-000` → census `TOTAL: 9`, `OFFLINE ONLY` → 0 cards, note `showing 0 of 9 matching` | ✅ |
+| `npm run build:css` → 28 kB minified stylesheet with all dynamic classes | ✅ |
 | `docker compose config` validation | ✅ |
 | `docker compose build` / container smoke test | ⏳ pending Docker daemon (`docker-on`) |
 
@@ -854,6 +1026,9 @@ battery; CO₂; current) and random-walks around a realistic baseline.
 | Terminal panel floods / UI sluggish | reduce ingest rate, use `FOCUS`, or raise `LOG_THROTTLE_MS` in `src/ingest.js` |
 | Rule fires constantly | increase `cooldown_seconds`; the burst limiter caps 25 triggers / 5 s |
 | Charts empty but devices online | only numeric values are charted; non-numeric payloads land in `raw_value` |
+| Cards show no sparkline | by design only cards inside the viewport own a Chart.js chart (`SPARKLINE_BUDGET = 32`); scroll the card into view. If the main chart also fails, check `/vendor/chart.umd.js` loads (`npm run vendor`) |
+| Every card reads OFFLINE although data is arriving | heartbeat mismatch: the browser uses `HEARTBEAT_MS` (30 s), the server `OFFLINE_AFTER_SECONDS`. Also check payload `ts`/`timestamp` — a stale or far-future epoch from a device with a wrong clock skews the window |
+| Card metric shows `--` | the sensor only ever sent non-numeric values, so nothing reached `latest_telemetry` |
 | `docker compose up` created an empty `./data` | external drive was not mounted (§10.4) |
 
 ---

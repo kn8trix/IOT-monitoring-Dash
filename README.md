@@ -3,6 +3,9 @@
 Space-Black / Neon-Green operator console for monitoring and controlling **200+
 IoT devices** in real time.
 
+- **Device grid:** one card per node — heartbeat status badge, IP/MAC metadata,
+  live neon metric blocks, a Chart.js sparkline of the last 10 readings and
+  `RELAY ON` / `RELAY OFF` quick actions
 - **Ingest:** HTTP webhooks **and** MQTT (`iot/+/telemetry`)
 - **Control:** command queue with MQTT publish **and** HTTP polling for devices
 - **Storage:** SQLite (`data/iot.db`) — devices, telemetry, commands, automation rules

@@ -20,7 +20,7 @@ const { bus, log } = require('./events');
 const DEVICE_KEYS = ['device_id', 'deviceId', 'device', 'id', 'node', 'client_id'];
 const SENSOR_KEYS = ['sensor_name', 'sensorName', 'sensor', 'metric', 'key', 'name'];
 const VALUE_KEYS = ['value', 'reading', 'val', 'data'];
-const META_KEYS = ['ip', 'name', 'location', 'firmware', 'unit', 'ts', 'timestamp', 'created_at'];
+const META_KEYS = ['ip', 'mac', 'name', 'location', 'firmware', 'unit', 'ts', 'timestamp', 'created_at'];
 
 function firstKey(obj, keys) {
   for (const key of keys) {
@@ -150,6 +150,7 @@ function ingestReading(input = {}, options = {}) {
       value: reading.value,
       unit: reading.unit ?? meta.unit,
       ip: meta.ip,
+      mac: meta.mac,
       name: meta.name,
       location: meta.location,
       firmware: meta.firmware,

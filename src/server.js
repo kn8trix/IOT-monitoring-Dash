@@ -152,7 +152,7 @@ function terminal(entry) {
 }
 
 function snapshot() {
-  const devices = db.listDevices({ limit: 1000 });
+  const devices = db.listDevices({ limit: 1000, sparkline: true, sparklinePoints: 10 });
   return {
     stats: { ...db.stats(), clients: io.engine.clientsCount },
     devices: devices.devices,
@@ -202,6 +202,8 @@ io.on('connection', (socket) => {
     const devices = db.listDevices({
       search: payload && payload.search ? String(payload.search) : '',
       limit: 1000,
+      sparkline: true,
+      sparklinePoints: 10,
     });
     const response = { ok: true, ...devices };
     if (typeof ack === 'function') ack(response);
@@ -219,7 +221,13 @@ io.on('connection', (socket) => {
 
 bus.on('log', terminal);
 bus.on('telemetry', (reading) => io.emit('telemetry_update', reading));
-bus.on('device', (device) => io.emit('device_update', device));
+// `device_status` is emitted alongside `device_update` (identical payload): the
+// first is the documented name for the device-grid badge, the second is kept for
+// backwards compatibility with earlier dashboard builds.
+bus.on('device', (device) => {
+  io.emit('device_update', device);
+  io.emit('device_status', device);
+});
 bus.on('command:queued', (command) => io.emit('command_sent', command));
 bus.on('command:delivered', (command) => io.emit('command_delivered', command));
 bus.on('command:acked', (command) => io.emit('command_acked', command));

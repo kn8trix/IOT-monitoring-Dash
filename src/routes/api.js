@@ -106,11 +106,17 @@ router.get('/mqtt/status', (req, res) => {
 /* -------------------------------------------------------------------------- */
 
 router.get('/devices', (req, res) => {
-  const { search, limit, offset } = req.query;
+  const { search, limit, offset, sparkline } = req.query;
+  // `sparkline=true` adds the last N samples per sensor (device-card mini-graph).
+  // Off by default: it costs ~45 ms and ~380 KB for a 1000-device fleet, and the
+  // dashboard gets it once per connect through the Socket.io bootstrap instead.
+  const withSparkline = sparkline === 'true' || sparkline === '1';
   const data = db.listDevices({
     search: search ? String(search).slice(0, 64) : '',
     limit: intParam(limit, 500, { min: 1, max: 2000 }),
     offset: intParam(offset, 0, { min: 0, max: 1_000_000 }),
+    sparkline: withSparkline,
+    sparklinePoints: intParam(req.query.sparkline_points, 10, { min: 2, max: 60 }),
   });
   res.json({ ok: true, count: data.devices.length, total: data.total, ...data });
 });

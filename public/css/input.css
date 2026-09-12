@@ -119,6 +119,16 @@
     background: linear-gradient(180deg, rgba(20, 28, 34, 0.9), rgba(11, 15, 18, 0.6));
   }
 
+  /* Sticky search / filter bar above the device grid. `--header-h` is kept in
+     sync with the top bar by a ResizeObserver in public/js/app.js. */
+  .sticky-bar {
+    position: sticky;
+    top: var(--header-h, 3.25rem);
+    z-index: 20;
+    background-color: var(--color-panel);
+    backdrop-filter: blur(6px);
+  }
+
   /* ---- glow ------------------------------------------------------------ */
 
   .glow-text {
@@ -159,8 +169,10 @@
   }
 
   .dot-offline {
-    background: #4b5a63;
-    box-shadow: none;
+    /* dim red, per the offline badge design */
+    background: #7f2b26;
+    box-shadow: 0 0 6px rgba(255, 59, 48, 0.35);
+    animation: none;
   }
 
   .dot-stale {
@@ -349,9 +361,12 @@
     transition:
       border-color 0.15s ease,
       transform 0.15s ease,
-      box-shadow 0.15s ease;
+      box-shadow 0.15s ease,
+      opacity 0.2s ease;
     position: relative;
     overflow: hidden;
+    display: flex;
+    flex-direction: column;
   }
 
   .device-card::before {
@@ -363,14 +378,22 @@
     transition: background 0.15s ease;
   }
 
+  /* Soft neon outer glow on hover. */
   .device-card:hover {
-    transform: translateY(-1px);
-    border-color: rgba(57, 255, 20, 0.35);
+    transform: translateY(-2px);
+    border-color: rgba(57, 255, 20, 0.55);
+    box-shadow:
+      0 0 0 1px rgba(57, 255, 20, 0.32),
+      0 0 26px rgba(57, 255, 20, 0.22);
   }
 
   .device-card.is-online::before {
     background: var(--color-neon);
     box-shadow: 0 0 10px rgba(57, 255, 20, 0.7);
+  }
+
+  .device-card.is-offline {
+    opacity: 0.82;
   }
 
   .device-card.is-selected {
@@ -380,8 +403,142 @@
       0 0 18px rgba(57, 255, 20, 0.16);
   }
 
-  .device-card.is-stale {
-    border-color: rgba(255, 176, 32, 0.5);
+  /* Fired for ~0.9 s whenever a card receives fresh telemetry. Uses box-shadow
+     only, so it never fights the selected/hover border colour. */
+  .device-card.card-live-flash {
+    animation: card-live-flash 0.9s ease-out;
+  }
+
+  /* ---- card header ----------------------------------------------------- */
+
+  .device-name {
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: #eafff0;
+    letter-spacing: 0.02em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .device-id {
+    font-size: 0.6rem;
+    color: #6d8b84;
+    letter-spacing: 0.08em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    flex: none;
+    border-radius: 999px;
+    border: 1px solid var(--color-edge);
+    background: #070b0d;
+    padding: 0.1rem 0.45rem;
+    font-size: 0.55rem;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+  }
+
+  .status-online {
+    border-color: rgba(57, 255, 20, 0.55);
+    color: var(--color-neon);
+    text-shadow: 0 0 8px rgba(57, 255, 20, 0.5);
+  }
+
+  .status-offline {
+    border-color: rgba(255, 59, 48, 0.3);
+    color: #b45c55;
+  }
+
+  /* ---- card telemetry -------------------------------------------------- */
+
+  .metric-block {
+    background: #070b0d;
+    border: 1px solid var(--color-edge);
+    border-radius: 0.4rem;
+    padding: 0.35rem 0.4rem;
+    min-width: 0;
+  }
+
+  .metric-label {
+    font-size: 0.52rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #47605a;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .metric-value {
+    font-size: 0.98rem;
+    font-weight: 700;
+    line-height: 1.2;
+    color: var(--color-neon);
+    text-shadow: 0 0 10px rgba(57, 255, 20, 0.35);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .metric-unit {
+    font-size: 0.55rem;
+    font-weight: 400;
+    margin-left: 0.12rem;
+    color: #6d8b84;
+    text-shadow: none;
+  }
+
+  .sparkline-box {
+    position: relative;
+    height: 2.6rem;
+    background: #070b0d;
+    border: 1px solid var(--color-edge);
+    border-radius: 0.4rem;
+    padding: 0.2rem 0.25rem 0.15rem;
+  }
+
+  .sparkline-label {
+    position: absolute;
+    top: 0.1rem;
+    right: 0.35rem;
+    font-size: 0.5rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #33504a;
+    pointer-events: none;
+  }
+
+  .relay-pill {
+    border: 1px solid var(--color-edge);
+    border-radius: 999px;
+    padding: 0 0.35rem;
+    font-size: 0.55rem;
+    letter-spacing: 0.06em;
+    color: #6d8b84;
+  }
+
+  .relay-pill.is-on {
+    border-color: rgba(57, 255, 20, 0.55);
+    color: var(--color-neon);
+    text-shadow: 0 0 8px rgba(57, 255, 20, 0.45);
+  }
+
+  .btn-relay {
+    padding: 0.3rem 0.4rem;
+    font-size: 0.55rem;
+    letter-spacing: 0.07em;
+  }
+
+  .btn-relay.is-active {
+    background: rgba(57, 255, 20, 0.14);
+    border-color: rgba(57, 255, 20, 0.6);
+    color: #eafff0;
   }
 
   .metric-chip {
@@ -530,6 +687,19 @@
   }
   97% {
     opacity: 1;
+  }
+}
+
+@keyframes card-live-flash {
+  0% {
+    box-shadow:
+      0 0 0 1.5px rgba(57, 255, 20, 0.75),
+      0 0 30px rgba(57, 255, 20, 0.45);
+  }
+  100% {
+    box-shadow:
+      0 0 0 1px rgba(57, 255, 20, 0),
+      0 0 0 rgba(57, 255, 20, 0);
   }
 }
 
