@@ -3,13 +3,21 @@
 Space-Black / Neon-Green operator console for monitoring and controlling **200+
 IoT devices** in real time.
 
-- **Device grid:** one card per node — heartbeat status badge, IP/MAC metadata,
-  live neon metric blocks, a Chart.js sparkline of the last 10 readings and
-  `RELAY ON` / `RELAY OFF` quick actions
+- **Device grid:** large clickable cards — heartbeat status badge, IP/MAC
+  metadata, the current reading in big neon type, last-update timestamp and a
+  summary of the node's active custom config
+- **Device inspector modal:** click any card for a per-device real-time chart, a
+  command panel, a custom-config editor (`sample_rate_ms`, `temp_threshold`, …)
+  with *Save & Sync to ESP*, and a device-only live console
+- **Upstream forwarding:** every telemetry batch is mirrored to
+  `MAIN_WEBSITE_WEBHOOK_URL` asynchronously, with delivery audited in `forward_logs`
+- **Device config API:** `GET`/`POST /api/device/:id/config` so an ESP/Arduino can
+  fetch its settings at boot
 - **Ingest:** HTTP webhooks **and** MQTT (`iot/+/telemetry`)
 - **Control:** command queue with MQTT publish **and** HTTP polling for devices
-- **Storage:** SQLite (`data/iot.db`) — devices, telemetry, commands, automation rules
-- **Realtime:** Socket.io fan-out (telemetry, commands, live terminal)
+- **Storage:** SQLite (`data/iot.db`) — devices, telemetry, commands, automation
+  rules, device configs, forward logs, settings
+- **Realtime:** Socket.io fan-out (telemetry, commands, config, forwarding, log)
 - **Automation:** threshold rules, e.g. *if temperature > 30 then `RELAY_OFF`*
 
 Full documentation — architecture, APIs, flashing ESP32/ESP8266 firmware, deployment
@@ -47,6 +55,23 @@ curl -X POST http://localhost:3000/api/webhook/data \
   -H 'Content-Type: application/json' \
   -d '{"device_id":"ESP32-0001","sensor_name":"temperature","value":31.4,"unit":"C"}'
 ```
+
+## Give a device its own configuration
+
+```bash
+curl -X POST http://localhost:3000/api/device/ESP32-0001/config \
+  -H 'Content-Type: application/json' \
+  -d '{"config":{"sample_rate_ms":1000,"temp_threshold":33,"relay_pin":2},"sync":true}'
+
+# the device reads it back at boot (defaults are merged in, never a 404)
+curl http://localhost:3000/api/device/ESP32-0001/config
+```
+
+## Forward everything to your main website
+
+Set the URL in the dashboard's **Settings ▸ FORWARDING** tab (or
+`MAIN_WEBSITE_WEBHOOK_URL` in `.env`). Ingest never waits for it; each attempt is
+logged to `forward_logs` and surfaced live in the UI.
 
 ## Send your first command
 

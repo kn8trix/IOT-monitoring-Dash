@@ -15,6 +15,18 @@
  *   GET  /api/telemetry/recent | /api/commands | /api/rule-events
  *   POST /api/commands
  *   GET|POST /api/rules  ·  PATCH|DELETE /api/rules/:id
+ *
+ * Device configuration (ESP/Arduino reads its own config at boot):
+ *   GET  /api/device/:id/config        full config (+ defaults)
+ *   POST /api/device/:id/config        save config from the dashboard
+ *   (also available as /api/devices/:id/config)
+ *
+ * Upstream forwarding to MAIN_WEBSITE_WEBHOOK_URL:
+ *   GET   /api/settings                effective + stored settings, runtime state
+ *   PATCH /api/settings                set URL / enabled flag from the dashboard
+ *   DELETE/api/settings/:key           clear a setting (revert to .env)
+ *   GET   /api/forward-logs            delivery audit trail from SQLite
+ *   POST  /api/forward/test            send a test document upstream now
  */
 
 const express = require('express');
@@ -24,6 +36,7 @@ const db = require('../db');
 const mqtt = require('../mqtt');
 const ingest = require('../ingest');
 const automation = require('../automation');
+const forwarder = require('../forwarder');
 const { log } = require('../events');
 
 const router = express.Router();
@@ -94,7 +107,15 @@ router.get('/health', (req, res) => {
 });
 
 router.get('/stats', (req, res) => {
-  res.json({ ok: true, data: { ...db.stats(), ingest: ingest.getStatus(), mqtt: mqtt.getStatus() } });
+  res.json({
+    ok: true,
+    data: {
+      ...db.stats(),
+      ingest: ingest.getStatus(),
+      mqtt: mqtt.getStatus(),
+      forward: forwarder.getStatus(),
+    },
+  });
 });
 
 router.get('/mqtt/status', (req, res) => {
@@ -135,6 +156,8 @@ router.get('/devices/:deviceId', (req, res) => {
       metrics: db.getLatest(id.value),
       sensors: db.getSensors(id.value),
       commands: db.listCommands({ device_id: id.value, limit: 20 }),
+      config: db.getDeviceConfig(id.value),
+      forward_logs: db.listForwardLogs({ device_id: id.value, limit: 10 }),
     },
   });
 });
@@ -236,7 +259,7 @@ router.post('/webhook/data', (req, res) => {
 
   for (const reading of result.readings) {
     if (ingest.shouldLogDevice(reading.device_id, reading.sensor_name)) {
-      log('info', 'HOOK', `⇐ ${ingest.summarize(reading)}`);
+      log('info', 'HOOK', `⇐ ${ingest.summarize(reading)}`, ingest.logMeta(reading));
     }
   }
 
@@ -268,7 +291,10 @@ router.post('/webhook/command', (req, res) => {
     mqtt_topic: mqtt.commandTopic(id.value),
   });
 
-  log('command', 'HOOK', `⇒ command queued for ${id.value} :: ${queued.payload}`);
+  log('command', 'HOOK', `⇒ command queued for ${id.value} :: ${queued.payload}`, {
+    device_id: id.value,
+    command_id: queued.id,
+  });
 
   return res.status(202).json({
     ok: true,
@@ -309,6 +335,186 @@ router.post('/webhook/command/ack', (req, res) => {
   if (!command) return fail(res, 404, `unknown command: ${commandId}`);
 
   return res.json({ ok: true, data: command });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Device custom configuration (ESP / Arduino)                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * GET /api/device/:deviceId/config
+ *
+ * What a microcontroller calls during setup(). Always returns a complete
+ * document: `DEFAULT_DEVICE_CONFIG` merged with whatever the dashboard saved.
+ */
+function getDeviceConfigHandler(req, res) {
+  const id = sanitizeDeviceId(req.params.deviceId);
+  if (id.error) return fail(res, 400, id.error);
+
+  const data = db.getDeviceConfig(id.value);
+  // Devices must always see the current revision, never a cached one.
+  res.set('Cache-Control', 'no-store');
+  return res.json({ ok: true, ...data, defaults: db.DEFAULT_DEVICE_CONFIG });
+}
+
+/**
+ * POST /api/device/:deviceId/config
+ *
+ * Body: `{ config: {...}, sync?: boolean, merge?: boolean }`
+ * A flat body (`{ sample_rate_ms: 1000 }`) is accepted too — everything except
+ * `sync`/`merge`/`updated_by` is then treated as the configuration itself.
+ */
+function postDeviceConfigHandler(req, res) {
+  const id = sanitizeDeviceId(req.params.deviceId);
+  if (id.error) return fail(res, 400, id.error);
+
+  const { body } = readBody(req);
+  const reserved = new Set(['config', 'sync', 'merge', 'updated_by', 'device_id']);
+
+  let next = body.config;
+  if (!next || typeof next !== 'object' || Array.isArray(next)) {
+    next = {};
+    for (const [key, value] of Object.entries(body)) {
+      if (!reserved.has(key)) next[key] = value;
+    }
+  }
+  if (!Object.keys(next).length) return fail(res, 400, 'config must be a non-empty JSON object');
+
+  let saved;
+  try {
+    saved = db.saveDeviceConfig(id.value, next, {
+      updatedBy: body.updated_by || 'dashboard',
+      merge: Boolean(body.merge),
+    });
+  } catch (error) {
+    return fail(res, 400, error.message);
+  }
+
+  // "Save & Sync to ESP" — optionally push the new revision to the device so it
+  // re-reads its configuration without waiting for a reboot.
+  let command = null;
+  if (body.sync) {
+    command = db.queueCommand({
+      device_id: id.value,
+      payload: JSON.stringify({
+        action: 'CONFIG_SYNC',
+        revision: saved.revision,
+        config: saved.config,
+        issued_at: Date.now(),
+      }),
+      source: 'config',
+      transport: 'queue',
+      mqtt_topic: mqtt.commandTopic(id.value),
+    });
+    log('command', 'CONFIG', `CONFIG_SYNC queued for ${id.value} (revision ${saved.revision})`, {
+      device_id: id.value,
+      command_id: command.id,
+    });
+  }
+
+  // A device that has never checked in is still worth registering.
+  db.upsertDevice({ device_id: id.value });
+
+  return res.json({ ok: true, data: saved, command });
+}
+
+router.get('/device/:deviceId/config', getDeviceConfigHandler);
+router.post('/device/:deviceId/config', postDeviceConfigHandler);
+// Plural aliases, consistent with the rest of the /api/devices surface.
+router.get('/devices/:deviceId/config', getDeviceConfigHandler);
+router.post('/devices/:deviceId/config', postDeviceConfigHandler);
+
+router.delete('/device/:deviceId/config', (req, res) => {
+  const id = sanitizeDeviceId(req.params.deviceId);
+  if (id.error) return fail(res, 400, id.error);
+  const removed = db.deleteDeviceConfig(id.value);
+  if (!removed) return fail(res, 404, `no saved config for ${id.value}`);
+  return res.json({ ok: true });
+});
+
+/* -------------------------------------------------------------------------- */
+/* System settings + upstream forwarding                                      */
+/* -------------------------------------------------------------------------- */
+
+router.get('/settings', (req, res) => {
+  const target = forwarder.resolveTarget();
+  res.json({
+    ok: true,
+    data: {
+      settings: db.allSettings(),
+      effective: {
+        url: target.url,
+        enabled: target.enabled,
+        source: target.source,
+        configured: target.configured,
+        valid: target.valid,
+        active: target.active,
+      },
+      env: { url: config.forward.url, enabled: config.forward.enabled },
+      runtime: forwarder.getStatus(),
+      stats_24h: db.forwardStats({ sinceMs: 24 * 60 * 60 * 1000 }),
+      keys: db.SETTING_KEYS,
+    },
+  });
+});
+
+function updateSettingsHandler(req, res) {
+  const { body } = readBody(req);
+  const changed = [];
+
+  if (body.MAIN_WEBSITE_WEBHOOK_URL !== undefined) {
+    const url = String(body.MAIN_WEBSITE_WEBHOOK_URL || '').trim();
+    if (url && !/^https?:\/\//i.test(url)) {
+      return fail(res, 400, 'MAIN_WEBSITE_WEBHOOK_URL must start with http:// or https://');
+    }
+    db.setSetting('MAIN_WEBSITE_WEBHOOK_URL', url || null);
+    changed.push('MAIN_WEBSITE_WEBHOOK_URL');
+  }
+
+  if (body.MAIN_WEBSITE_FORWARD_ENABLED !== undefined) {
+    const enabled = body.MAIN_WEBSITE_FORWARD_ENABLED === true || String(body.MAIN_WEBSITE_FORWARD_ENABLED) === 'true';
+    db.setSetting('MAIN_WEBSITE_FORWARD_ENABLED', String(enabled));
+    changed.push('MAIN_WEBSITE_FORWARD_ENABLED');
+  }
+
+  if (!changed.length) return fail(res, 400, 'nothing to update');
+
+  const target = forwarder.resolveTarget();
+  log('info', 'SET', `system settings updated (${changed.join(', ')}) — forwarding ${target.enabled ? 'enabled' : 'disabled'}${target.url ? ` → ${target.url}` : ''}`);
+
+  return res.json({ ok: true, changed, effective: target, runtime: forwarder.getStatus() });
+}
+
+router.patch('/settings', updateSettingsHandler);
+router.post('/settings', updateSettingsHandler);
+
+router.delete('/settings/:key', (req, res) => {
+  const removed = db.deleteSetting(req.params.key);
+  if (!removed) return fail(res, 404, `unknown setting: ${req.params.key}`);
+  log('warn', 'SET', `setting ${req.params.key} cleared — falling back to .env`);
+  return res.json({ ok: true, effective: forwarder.resolveTarget() });
+});
+
+router.get('/forward-logs', (req, res) => {
+  const deviceId = req.query.device_id ? sanitizeDeviceId(req.query.device_id) : null;
+  if (deviceId && deviceId.error) return fail(res, 400, deviceId.error);
+  const rows = db.listForwardLogs({
+    device_id: deviceId ? deviceId.value : undefined,
+    limit: intParam(req.query.limit, 50, { min: 1, max: 500 }),
+  });
+  return res.json({
+    ok: true,
+    count: rows.length,
+    data: rows,
+    stats: db.forwardStats({ sinceMs: intParam(req.query.since_ms, 24 * 60 * 60 * 1000, { min: 1000, max: 30 * 86_400_000 }) }),
+    runtime: forwarder.getStatus(),
+  });
+});
+
+router.post('/forward/test', async (req, res) => {
+  const { body } = readBody(req);
+  const result = await forwarder.sendTest(body.payload || null);
+  return res.status(result.ok ? 200 : 502).json({ ok: result.ok, ...result });
 });
 
 /* -------------------------------------------------------------------------- */

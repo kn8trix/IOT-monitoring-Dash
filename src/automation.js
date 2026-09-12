@@ -162,6 +162,7 @@ function evaluate(reading) {
         'AUTO',
         `RULE FIRED #${rule.id} "${rule.name}" on ${reading.device_id}: ${reading.sensor_name}=${reading.value}` +
           ` ${rule.operator} ${rule.threshold} → ${rule.action}`,
+        { device_id: reading.device_id, rule_id: rule.id, value: reading.value, action: rule.action },
       );
       bus.emit('rule:triggered', { rule, reading, command });
     } catch (error) {

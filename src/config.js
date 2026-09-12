@@ -61,6 +61,26 @@ const config = {
     maxRows: toInt(process.env.TELEMETRY_MAX_ROWS, 2_000_000),
     maxCommands: 20_000,
     maxRuleEvents: 5_000,
+    maxForwardLogs: 5_000,
+  },
+
+  /**
+   * Upstream forwarding: every ingested batch is mirrored to the main website.
+   * The URL/enabled flag can also be set at runtime from the dashboard (those
+   * values are stored in the `settings` table and take precedence over .env).
+   */
+  forward: {
+    url: process.env.MAIN_WEBSITE_WEBHOOK_URL || '',
+    enabled: toBool(
+      process.env.MAIN_WEBSITE_FORWARD_ENABLED,
+      Boolean(process.env.MAIN_WEBSITE_WEBHOOK_URL),
+    ),
+    timeoutMs: toInt(process.env.FORWARD_TIMEOUT_MS, 8000),
+    retries: toInt(process.env.FORWARD_RETRIES, 2),
+    concurrency: toInt(process.env.FORWARD_CONCURRENCY, 4),
+    maxQueue: toInt(process.env.FORWARD_MAX_QUEUE, 5000),
+    retryBackoffMs: toInt(process.env.FORWARD_RETRY_BACKOFF_MS, 1500),
+    payloadBytes: toInt(process.env.FORWARD_MAX_PAYLOAD_BYTES, 16384),
   },
 
   seed: {

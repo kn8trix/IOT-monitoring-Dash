@@ -37,6 +37,11 @@ services:
       OFFLINE_AFTER_SECONDS: "30"
       SWEEP_INTERVAL_SECONDS: "15"
       TELEMETRY_RETENTION_DAYS: "14"
+      # Upstream mirror of every ingested payload (main website endpoint).
+      # Can also be set from the dashboard: Settings → Forwarding.
+      MAIN_WEBSITE_WEBHOOK_URL: "${MAIN_WEBSITE_WEBHOOK_URL:-}"
+      MAIN_WEBSITE_FORWARD_ENABLED: "${MAIN_WEBSITE_FORWARD_ENABLED:-false}"
+      FORWARD_RETRIES: "2"
     volumes:
       # SQLite + WAL live on the host so data survives rebuilds.
       # Keep this path on a Linux-native filesystem (ext4/xfs). exFAT/NTFS/SMB

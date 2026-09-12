@@ -34,10 +34,15 @@ automation engine.
                                            │  ./data/iot.db                         │
                                            │  devices · telemetry · latest_telemetry│
                                            │  commands · automation_rules · events  │
+                                           │  device_configs · forward_logs         │
+                                           │  settings                              │
                                            └────────────────────────────────────────┘
 
        Browser ── HTTP (static + REST) ──▶ node-server
-               └─ WebSocket (Socket.io) ─▶ live telemetry, commands, terminal stream
+               └─ WebSocket (Socket.io) ─▶ live telemetry, commands, config, log stream
+
+       node-server ── POST (async, retried) ──▶ MAIN_WEBSITE_WEBHOOK_URL
+                     every accepted telemetry batch is mirrored upstream (§6.4)
 ```
 
 ### Components
@@ -51,6 +56,7 @@ automation engine.
 | Message broker | Eclipse Mosquitto 2 | MQTT 3.1.1/5.0 on 1883, WebSockets on 9001 |
 | MQTT client | `mqtt` 5 | auto-reconnect, degrade-gracefully design |
 | Front-end | Tailwind CSS 4 (compiled) + Chart.js 4 + vanilla JS | no CDN, no runtime build step |
+| Upstream sync | `fetch` + in-process queue (`src/forwarder.js`) | mirrors every telemetry batch to the main website, off the ingest path (§6.4) |
 | Container | Docker + Docker Compose | two services, one bridge network |
 
 ### Internal event flow (why modules stay decoupled)
@@ -63,7 +69,9 @@ HTTP webhook ─┐
               ├─▶ src/ingest.js ─▶ db.recordTelemetry() ─▶ bus "telemetry"
 MQTT message ─┘                                             │
                                                             ├─▶ automation engine (rules)
-                                                            └─▶ Socket.io "telemetry_update"
+                                                            ├─▶ Socket.io "telemetry_update"
+                                                            └─▶ bus "ingest:batch" ─▶ src/forwarder.js
+                                                                                       └─▶ POST MAIN_WEBSITE_WEBHOOK_URL
 
 anything ─▶ db.queueCommand() ─▶ bus "command:queued" ─▶ MQTT publish iot/<id>/command
                                                        └─▶ Socket.io "command_sent"
@@ -83,16 +91,18 @@ rule takes exactly the same path — one place to debug, one place to log.
 │   ├── config.js        every env var, with defaults
 │   ├── db.js            schema, migrations, prepared statements, seeds
 │   ├── ingest.js        payload normalisation + persistence + fan-out
+│   ├── forwarder.js     upstream forwarding queue (MAIN_WEBSITE_WEBHOOK_URL)
 │   ├── automation.js    rule engine (cooldowns, burst limiter)
 │   ├── mqtt.js          MQTT bridge (subscribe telemetry/status/ack, publish commands)
 │   ├── events.js        internal event bus + logger
 │   ├── middleware.js    rate limiting + request logging
 │   └── routes/api.js    all REST endpoints and webhooks
 ├── public/
-│   ├── index.html       dashboard markup
+│   ├── index.html       dashboard markup (device grid + both modals)
 │   ├── css/input.css    Tailwind source + neon theme (EDIT THIS)
 │   ├── css/app.css      compiled stylesheet (BUILD ARTEFACT — do not edit)
-│   ├── js/app.js        dashboard client (socket wiring, grid, charts, terminal)
+│   ├── js/app.js        dashboard client (socket wiring, card grid, inspector
+│   │                    modal, config editor, settings, terminals)
 │   └── vendor/chart.umd.js   vendored Chart.js (offline-capable)
 ├── scripts/
 │   ├── simulator.js     synthetic 200+ device fleet
@@ -133,26 +143,46 @@ Glow effects are `text-shadow`/`box-shadow` in `public/css/input.css`
 (`.glow-text`, `.glow-text-soft`, `.glow-border`, `.neon-title`, `.dot-online`
 pulse, `.card-live-flash`, `.term-cursor` blink).
 
-### 3.1 Device-card monitoring grid
+### 3.1 Device cards — the main monitoring surface
 
-Every registered device renders as a card (`public/js/app.js` → `cardInner()`),
-laid out `1 → 2 → 3 → 4` columns (mobile → sm → xl → 2xl).
+The dashboard body is deliberately only three things: header, stat strip and the
+device grid. The global telemetry chart, the permanent side control panel and the
+global terminal were removed from the main view — everything they did now lives in
+modals (§3.2, §3.3), so the grid gets the full width and the operator's attention.
+
+Every registered device renders as a **large card** (`public/js/app.js` →
+`cardInner()`): minimum height **260 px**, laid out `1 → 2 → 3` columns
+(mobile → md → xl, capped at three on desktop).
 
 ```
-┌──────────────────────────────────────────────┐
-│ Sensor Node 6              ◉ ONLINE          │  ← name + id, heartbeat badge
-│ ESP32-0006                                   │
-│ IP  10.1.6.10                                │  ← monospace metadata
-│ MAC A4:CF:12:00:00:06                        │
-│ ┌────────────┬────────────┬────────────┐     │
-│ │ HUMIDITY   │ PRESSURE   │ TEMPERATURE│     │  ← high-contrast stat blocks
-│ │ 51.2 %     │ 1,012.8 hPa│ 24.6 °C    │     │    (large bold neon green)
-│ └────────────┴────────────┴────────────┘     │
-│ ╱╲╱‾╲╱ sparkline (last 10 readings)          │  ← Chart.js mini-graph
-│ Updated 3 seconds ago        RELAY ON  v1.4.2│  ← last ping + relay state
-│ [ RELAY ON ][ RELAY OFF ][ LOGS ]            │  ← card quick actions
-└──────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────┐
+│ Sensor Node 6                        ◉ ONLINE      │  ← name + id, heartbeat badge
+│ ESP32-0006                                         │
+│ IP 10.1.6.10 · Greenhouse                          │  ← monospace metadata
+│ MAC A4:CF:12:00:00:06                              │
+│                                                    │
+│ TEMPERATURE                                        │  ← primary sensor label
+│ 24.6 °C                                            │  ← large bold neon reading
+│ humidity 51.2 % · pressure 1012.8 hPa              │  ← secondary readings
+│                                                    │
+│ CUSTOM CONFIG  rev 3                               │  ← active config summary
+│ [sample_rate_ms 1000] [temp_threshold 33] [relay_pin 2]
+│ ────────────────────────────────────────────────── │
+│ Updated 3 seconds ago                      OPEN ▸  │  ← last ping
+└────────────────────────────────────────────────────┘
 ```
+
+**Headline reading.** `primarySensor()` picks the headline series — `temperature`
+when present, otherwise the first sensor alphabetically — rendered by
+`.reading-value` in large bold `#39FF14` with the unit as a small suffix. Up to
+three other sensors follow as a secondary line, and the block reads
+`AWAITING DATA` until the first frame arrives.
+
+**Active config summary.** `configTags()` renders up to three `key value` pills
+from the device's saved configuration (plus `+N` when more keys exist) next to the
+revision in the label (`CUSTOM CONFIG rev 3`). A node with nothing saved shows
+`no custom config`. This is the at-a-glance answer to "which nodes have been
+re-provisioned" — §3.4 covers where those values come from.
 
 **Status badge / heartbeat rule.** A card is `ONLINE` while its last ping is
 younger than **30 s** — the glowing neon-green dot pulses and the badge reads
@@ -166,30 +196,15 @@ applied in two places so the UI is never stale:
 
 Keep the two values in sync when changing either one.
 
-**Telemetry stat blocks.** The three highest-priority sensors of each node are
-rendered as stat blocks (`.metric-block`), value in large bold `#39FF14` with the
-unit as a small suffix. `primarySensor()` picks the sparkline series:
-`temperature` when present, otherwise the first sensor alphabetically.
-
-**Sparklines (Chart.js).** One line chart per card showing the last
-`MINI_POINTS = 10` readings, neon border + vertical gradient fill, no axes,
-animation off. Chart.js instances are expensive, so they are **created lazily and
-destroyed when scrolled out of view** (IntersectionObserver with a 120 px margin,
-`SPARKLINE_BUDGET = 32` concurrent instances max). The initial history comes from
-the server (`bootstrap.devices[].sparkline`, see §4 and §7); every subsequent
-frame is appended client-side from `telemetry_update`, so no server round-trip is
-needed per sample.
-
-**Quick actions** (buttons never steal the card's click-to-select behaviour):
-
-| Control | Effect |
-| --- | --- |
-| `RELAY ON` / `RELAY OFF` | `POST /api/webhook/command` with `{"action":"RELAY_ON","source":"quick-action"}`; the button shows a spinner, the relay pill switches to `RELAY ON/OFF`, and a toast reports whether it was published to MQTT or left queued for polling |
-| `LOGS` | scopes the live terminal to that device (`state.termDevice`); a chip appears in the terminal header (`DEVICE: ESP32-0006 ✕`) and only lines mentioning the device are shown |
+**Click-to-open.** The whole card is the control (`cursor: pointer`,
+`role="button"`, `aria-label`, Tab + Enter work too) and opens the device
+inspector for that node — see §3.2. No card contains a button any more: the relay
+toggles, the command form and the per-device log all live in the modal, so a stray
+click can never queue a command onto the fleet.
 
 **Live updates without re-rendering.** When `telemetry_update` / `device_status`
-arrives the matching card is patched in place (`updateCard()`): metric values,
-sparkline (append + trim), last-ping label, IP/MAC/firmware and the badge. The
+arrives the matching card is patched in place (`updateCard()`): headline and
+secondary readings, last-ping label, IP/MAC/firmware, config tags and the badge. The
 card then runs a ~0.9 s neon border flash (`.card-live-flash`) as a visual
 "fresh data" cue — this is `box-shadow` only, so it never fights the
 `is-selected` / hover border colours. A full grid re-render only happens when the
@@ -204,9 +219,88 @@ top bar wraps on narrow screens. The census always counts the search-scoped set
 (independent of the status filter), while the grid note shows
 `showing N of M matching`.
 
-Performance guards: `PAGE_SIZE = 24` cards per page ("LOAD MORE"), sparkline
-cards capped at 32, per-card patches instead of re-renders, and heartbeat
-repaints every 5 s touching only the visible cards.
+Performance guards: `PAGE_SIZE = 12` of these large cards per page ("LOAD MORE"),
+per-card patches instead of re-renders, Chart.js instances created only for the
+open inspector, and heartbeat repaints every 5 s touching only visible cards.
+
+### 3.2 Device inspector modal
+
+Clicking any card opens `#device-modal` — a full-screen Space-Black (`#06090B`)
+surface with neon accents, scoped to exactly one device. One DOM tree is reused for
+every node (no per-card markup); it is populated from `GET /api/devices/:id` and
+then kept live by the socket stream.
+
+**Header.** Device name + id, IP, MAC, location, firmware, the ONLINE/OFFLINE
+badge, six quick actions (`RELAY ON`, `RELAY OFF`, `RESTART`, `STATUS`, `PING`,
+`CONFIG_SYNC`) and the `✕` close button. `Esc` closes it too.
+
+**Four tabs** (`data-modal-tab`, one panel visible at a time):
+
+| Tab | Contents |
+| --- | --- |
+| `TELEMETRY` | Chart.js line graph for **this device only** — sensor picker, `1m / 5m / 15m / 1h` window, `● LIVE` pause, min/max/avg/sample readout. History is backfilled over `request:history`; new points arrive on `telemetry_update` while the tab is live. |
+| `COMMANDS` | Payload mode `TEXT` / `JSON` with validation, glowing send button, and the 20 most recent commands for this device with status pills. |
+| `CONFIG` | The custom device configuration editor (§3.4). |
+| `LOGS` | Live console for this device only — `#dm-terminal`, `#05080A`, monospace, blinking cursor, `PAUSE` / `CLEAR`, line counter. Backfilled from REST history, then streamed live. |
+
+**The per-device log is deliberately not the global log.** The server throttles the
+system log to 25 lines/s (`TERMINAL_MAX_LINES_PER_SEC`, `src/server.js`) so a
+220-node fleet cannot flood a browser; a device console riding that stream would be
+full of holes. Telemetry therefore reaches it straight from the client's
+`telemetry_update` handler (`onTelemetry()` → `pushDeviceLog()`), which is never
+throttled. Command, MQTT, forwarding and rule lines are mirrored from the system log
+by `mirrorToDeviceLog()`, filtered on `meta.device_id` — and mirrored **before** the
+system log's own `FOCUS`/`PAUSE` filters, because narrowing the global log must not
+silently stop the device console. Ingest lines are excluded there
+(`entry.meta.sensor_name`) precisely because `onTelemetry` already covers them.
+
+**Unsaved config edits are protected.** The modal refetches the device document
+whenever a `forward_log` event lands for the open device. `renderConfigEditor()`
+refuses to repaint while `state.device.configDirty` is set, so that background
+refresh cannot wipe a half-typed config; the status line then reads
+`draft in progress — newer revision not loaded`. The flag clears on save
+(`renderConfigEditor(saved, { force: true })`) and when another device is opened.
+
+### 3.3 Settings modal
+
+`#settings-modal` collects the operator surfaces that used to be permanent panels.
+Four tabs:
+
+| Tab | Contents |
+| --- | --- |
+| `FORWARDING` | Upstream webhook URL + enable toggle, `TEST`, `SAVE`, live queue / delivered / failed counters and the recent `forward_logs` table — see §6.4. Saving calls `PATCH /api/settings` and broadcasts `settings_changed`. |
+| `AUTOMATION` | Rule list with neon toggles, delete buttons, trigger counts, the "new rule" form and the recent-trigger feed. |
+| `QUEUE` | The last 50 commands with status pills (`pending` / `delivered` / `acked` / `failed`). |
+| `SYSLOG` | The global terminal — deep-black `#05080A`, blinking cursor, `FOCUS` (webhooks, commands and rules only), `PAUSE`, `CLEAR`, 400-line window. |
+
+### 3.4 Device custom configuration (and the ESP boot loop)
+
+Per-device JSON keyed by device id, revisioned in SQLite (`device_configs`, §4).
+The editor presents two views over the same draft:
+
+- **Form** — one row per key (`.cfg-row`) with the input type inferred from the
+  JSON value (`number` / `checkbox` / text), plus `+ ADD FIELD` and a per-row `✕`.
+  Editing a row rewrites the JSON pane (`syncJsonFromForm()`).
+- **Raw JSON** — the source of truth on save. Each keystroke is parsed after a
+  220 ms debounce and, when valid, regenerates the form (`syncFormFromJson()`).
+  Invalid JSON shows a red `✗ …` message; nothing is saved until it parses.
+
+`SAVE & SYNC TO ESP` → `POST /api/device/:id/config`. The server bumps `revision`,
+upserts the row, emits `device_config` so every open dashboard updates, and — when
+`NOTIFY DEVICE` is ticked — queues a `CONFIG_SYNC` command so the node re-reads its
+settings over MQTT or HTTP polling. `GET /api/device/:id/config` is the read side; a
+device that has never saved anything gets the firmware defaults with
+`has_custom: false` rather than a 404, which is exactly what the boot sequence in
+§6.5 relies on. A realistic starting set:
+
+```json
+{
+  "sample_rate_ms": 1000,
+  "temp_threshold": 33,
+  "relay_pin": 2,
+  "mqtt_interval_ms": 5000
+}
+```
 
 ### Typography
 
@@ -221,24 +315,12 @@ the dashboard renders identically on an offline LAN.
    node counters, connected-client count, clock.
 2. **Stat strip** — devices total/online/offline, readings per minute, telemetry
    rows, queued commands, active rules, uptime.
-3. **Real-time telemetry** — Chart.js line graph, neon `#39FF14` border with a
-   vertical gradient fill, device/sensor/range selectors, `● LIVE` pause toggle,
-   min/max/avg/sample readout.
-4. **Device cards grid** — the monitoring surface (see §3.1): one rich card per
-   node with name + device id, heartbeat status badge, IP/MAC metadata, live
-   telemetry stat blocks, a Chart.js sparkline, last-ping label and quick
-   actions. Sticky search/filter/counter bar above it, paginated "load more".
-5. **Control panel** — target device id (with autocomplete), text/JSON payload
-   mode with validation, quick-command chips, glowing `▶ SEND COMMAND` button.
-6. **Automation** — rule list with neon toggles, delete buttons, trigger counts,
-   "new rule" form, recent-trigger feed.
-7. **Command queue** — last 50 commands with status pills
-   (`pending`/`delivered`/`acked`/`failed`).
-8. **Live terminal** — deep-black `#05080A` console streaming every inbound
-   webhook, outbound command, MQTT event and automation firing, with a blinking
-   square cursor. `FOCUS` hides routine noise, `PAUSE` freezes the scroll,
-   `CLEAR` empties the buffer (400-line window, server-side throttled to 25 lines/s
-   so a 220-device fleet cannot flood the browser).
+3. **Device grid** — the entire body: large clickable cards (§3.1) beneath a
+   sticky search / status-filter / census bar, paginated with `LOAD MORE`.
+4. **Device inspector modal** — per-device real-time chart, command panel, custom
+   configuration editor and device-scoped console (§3.2).
+5. **Settings modal** — upstream data forwarding, automation rules, the command
+   queue and the global system log (§3.3).
 
 ---
 
@@ -252,6 +334,9 @@ the dashboard renders identically on an offline LAN.
 | `commands` | command queue + audit | `id` PK, `device_id`, `payload`, `status`, `source`, `transport`, `mqtt_topic`, `created_at`, `delivered_at`, `acked_at`, `error` |
 | `automation_rules` | threshold rules | `id` PK, `name`, `device_id` (`*` = fleet-wide), `sensor_name`, `operator`, `threshold`, `action`, `action_payload`, `enabled`, `cooldown_seconds`, `last_triggered`, `trigger_count` |
 | `rule_events` | automation audit trail | `rule_id`, `device_id`, `sensor_name`, `value`, `operator`, `threshold`, `action`, `created_at` |
+| `device_configs` | per-device custom configuration | `device_id` PK, `config` (JSON text), `revision`, `updated_by`, `updated_at` |
+| `forward_logs` | upstream forwarding audit trail | `id` PK, `device_id`, `url`, `status` (`success`/`failed`/`dropped`), `http_status`, `duration_ms`, `error`, `source` (`http`/`mqtt`), `created_at` |
+| `settings` | runtime-overridable system settings | `key` PK, `value`, `updated_at`, `updated_by` |
 
 Indexes exist on `telemetry(device_id, sensor_name, created_at DESC)`,
 `telemetry(created_at DESC)`, `commands(device_id, status, id)`,
@@ -263,6 +348,7 @@ Schema version is tracked in `PRAGMA user_version`:
 | --- | --- |
 | `1` | initial build |
 | `2` | `devices.mac` (rendered on the device cards) |
+| `3` | `device_configs`, `forward_logs`, `settings` (device inspector + upstream forwarding) |
 
 Migrations are additive and run on boot in `src/db.js` → `migrate()`:
 `CREATE TABLE IF NOT EXISTS` never alters an existing table, so column additions
@@ -272,6 +358,7 @@ are applied explicitly (`ALTER TABLE devices ADD COLUMN mac TEXT` when
 ```
 [DB] migration applied: devices.mac (schema v2)
 [DB] schema version 1 -> 2
+[DB] schema version 2 -> 3
 ```
 
 **Liveness (heartbeat):** a device is `online` while telemetry/status/poll traffic
@@ -328,6 +415,7 @@ Rate limit: `RATE_LIMIT_MAX_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS` per IP
 | `POST` | `/api/webhook/command` | `{device_id, command}` or `{device_id, payload}` (plain text also accepted) | queue a command and publish it to MQTT |
 | `GET` | `/api/webhook/command/poll` | `?device_id=ESP32-0001&limit=20` | HTTP-polling devices collect pending commands (marks them `delivered`, refreshes liveness) |
 | `POST` | `/api/webhook/command/ack` | `{command_id, status:"acked"\|"failed", error?}` | device confirms execution |
+| `GET` | `/api/device/:deviceId/config` | — | **boot-time config pull** for the firmware: the saved JSON plus defaults, `revision` and `has_custom` (§6.5) |
 
 ### Dashboard / integration API
 
@@ -348,6 +436,14 @@ Rate limit: `RATE_LIMIT_MAX_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS` per IP
 | `POST` | `/api/rules/:id/toggle` | `{enabled: true\|false}` (or omit to invert) |
 | `DELETE` | `/api/rules/:id` | remove a rule |
 | `GET` | `/api/rule-events` | `?limit=25` — automation audit trail |
+| `GET` | `/api/device/:deviceId/config` | saved config + defaults for one device (`has_custom`, `revision`, `updated_at`) |
+| `POST` | `/api/device/:deviceId/config` | `{config, sync?, updated_by?}` — save a revision; `sync:true` also queues `CONFIG_SYNC`. Broadcasts `device_config` |
+| `DELETE` | `/api/device/:deviceId/config` | drop the saved config, reverting the node to firmware defaults |
+| `GET` | `/api/settings` | `{settings, effective, env, runtime}` — forwarding status incl. queue/delivered/failed counters |
+| `PATCH` · `POST` | `/api/settings` | `{main_website_webhook_url, forwarding_enabled}` — runtime override, persisted in SQLite and broadcast as `settings_changed` |
+| `DELETE` | `/api/settings/:key` | remove a runtime override, falling back to `.env`/default |
+| `GET` | `/api/forward-logs` | `?device_id=&limit=50` — delivery audit trail + aggregate stats |
+| `POST` | `/api/forward/test` | `{url?}` — send one probe payload upstream now; `502` when the remote rejects it |
 
 ### Examples
 
@@ -419,6 +515,116 @@ Automation commands are structured:
 }
 ```
 
+### 6.4 Upstream forwarding to the main website
+
+Every accepted telemetry batch — MQTT or `POST /api/webhook/data` — is mirrored to
+`MAIN_WEBSITE_WEBHOOK_URL` so the main website keeps its own copy of the fleet.
+Implementation: `src/forwarder.js`.
+
+**Turning it on** (either way; the dashboard wins when both are set):
+
+1. **From the UI (preferred).** Settings modal → `FORWARDING` tab → paste the URL,
+tick *enabled*, `SAVE`. This writes the `settings` rows
+`MAIN_WEBSITE_WEBHOOK_URL` / `MAIN_WEBSITE_FORWARD_ENABLED` in SQLite
+(`source: database`), so it survives restarts and needs no container change. Use
+`TEST` to fire a probe payload immediately.
+2. **From `.env` / compose** — `MAIN_WEBSITE_WEBHOOK_URL=https://main.example.com/api/iot`
+and `MAIN_WEBSITE_FORWARD_ENABLED=true`, then restart (`source: env`).
+
+`GET /api/settings` reports both layers so you can always tell which one is in
+effect (`effective.source` = `database` | `env` | `unset`).
+
+**What is posted** (`POST`, `Content-Type: application/json`):
+
+```json
+{
+  "source": "iot-dashboard",
+  "event": "telemetry",
+  "transport": "mqtt",
+  "received_at": 1789195778000,
+  "device": { "device_id": "ESP32-0001", "name": "Sensor Node 1", "ip": "10.1.1.10", "mac": "A4:CF:12:00:01", "location": "Greenhouse", "firmware": "1.4.2", "status": "online" },
+  "sensors": { "temperature": 31.4, "humidity": 48 },
+  "readings": [ { "sensor_name": "temperature", "value": 31.4, "unit": "C", "created_at": 1789195778000 } ],
+  "raw": { "device_id": "ESP32-0001", "sensors": { "temperature": 31.4 } }
+}
+```
+
+Headers carry `X-IoT-Source: iot-dashboard` and `X-IoT-Device: <device_id>` so the
+receiving site can route or filter without parsing the body. `raw` is the exact
+payload the device sent (truncated to `FORWARD_MAX_PAYLOAD_BYTES`).
+
+**Delivery guarantees.** Asynchronous by construction: ingest never waits for the
+upstream site, the batch goes on an in-memory queue drained by
+`FORWARD_CONCURRENCY` workers. `FORWARD_RETRIES` retries with linear backoff on
+network errors, `408`, `429` and `5xx`; other `4xx` fail immediately (a bad URL
+will not be hammered). Beyond `FORWARD_MAX_QUEUE` jobs the oldest are **dropped and
+counted**, never silently lost — `dropped` is on `/api/settings`.
+
+Every attempt lands in `forward_logs` and is broadcast as the `forward_log` socket
+event, which is what the FORWARDING tab renders: `status`, `http_status`,
+`duration_ms`, `attempt`, `error`, `created_at`. The device inspector also shows
+`✓ success (HTTP 200)` or `✗ failed …` for the device you have open.
+
+> Measured on this build: with an unreachable upstream URL, `POST /api/webhook/data`
+> still returns in **2–3 ms** — forwarding is provably off the ingest path.
+
+**Relevant env vars** (see §11): `MAIN_WEBSITE_WEBHOOK_URL`,
+`MAIN_WEBSITE_FORWARD_ENABLED`, `FORWARD_TIMEOUT_MS` (8000),
+`FORWARD_RETRIES` (2), `FORWARD_CONCURRENCY` (4), `FORWARD_MAX_QUEUE` (5000),
+`FORWARD_RETRY_BACKOFF_MS` (1500), `FORWARD_MAX_PAYLOAD_BYTES` (16384).
+
+**Receiving end — minimal Express example:**
+
+```js
+app.post('/api/iot', (req, res) => {
+  const { device, sensors, received_at } = req.body;
+  console.log(`[${device.device_id}] ${JSON.stringify(sensors)} @ ${received_at}`);
+  res.json({ ok: true }); // anything 2xx counts as delivered
+});
+```
+
+### 6.5 ESP / Arduino boot-time configuration
+
+A device can configure itself from the server on every boot, so re-provisioning a
+node never means re-flashing it:
+
+```cpp
+// 1. ask for the config first
+HTTPClient http;
+http.begin(String(BASE_URL) + "/api/device/" + DEVICE_ID + "/config");
+int code = http.GET();
+if (code == 200) {
+  DynamicJsonDocument doc(2048);
+  deserializeJson(doc, http.getString());
+  // `config` already contains firmware defaults for keys never saved,
+  // and `saved` contains only what the operator set.
+  int   sampleRate  = doc["config"]["sample_rate_ms"]  | 5000;
+  float tempLimit   = doc["config"]["temp_threshold"] | 30.0;
+  int   relayPin    = doc["config"]["relay_pin"]      | 2;
+  long  mqttEvery   = doc["config"]["mqtt_interval_ms"] | 5000;
+  if (doc["has_custom"].as<bool>()) Serial.println("using saved config");
+}
+http.end();
+
+// 2. then start reporting telemetry with those values
+```
+
+Notes for firmware authors:
+
+- **Never 404s.** An unknown or never-configured device gets the defaults with
+  `has_custom: false` (see the `GET` example in §6). That is deliberate: a factory-fresh
+  board must be able to boot without an operator pre-registering it.
+- `revision` increments on every save, so a device can cache its config and only
+  re-fetch when the number changes. `updated_at` is epoch ms.
+- When the dashboard saves with **NOTIFY DEVICE** ticked, the server also queues a
+  `CONFIG_SYNC` command (`POST /api/webhook/command` path, so MQTT *and* HTTP
+  polling both work) — a running device can re-read its settings without a reboot.
+- A sensible set of keys (`sample_rate_ms`, `temp_threshold`, `relay_pin`,
+  `mqtt_interval_ms`) is returned as defaults, so a first-boot parse always finds
+  something to fall back on. Extra keys are preserved verbatim.
+- `DELETE /api/device/:id/config` wipes the saved row and returns the node to
+  defaults — handy when a bad config bricks a test rig.
+
 ---
 
 ## 7. Socket.io events
@@ -438,7 +644,10 @@ channel — the grid never polls REST.
 | S→C | `rules_changed` | full rule list |
 | S→C | `stats` | counters + `clients`, every 5 s |
 | S→C | `mqtt_status` | broker state on change |
-| S→C | `terminal` | `{level, source, message, ts, meta?}` — the bottom console |
+| S→C | `terminal` | `{level, source, message, ts, meta?}` — the system log in the settings modal; `meta.device_id` is what the device inspector filters on |
+| S→C | `device_config` | `{device_id, config, saved, revision, updated_at, has_custom}` — emitted on every save, so all dashboards and the device card's config tags stay in sync |
+| S→C | `forward_log` | `{id, device_id, url, status, http_status, attempt, duration_ms, error?, created_at}` — one per upstream delivery attempt |
+| S→C | `settings_changed` | the raw `settings` map after any write (the client then refetches `GET /api/settings` for the `effective` view) |
 | C→S | `request:snapshot` | ack callback receives a fresh snapshot |
 | C→S | `request:history` | `{device_id, sensor_name, limit, since_ms}` → ack with `points[]` |
 | C→S | `request:devices` | `{search}` → ack with the device list (includes `sparkline`) |
@@ -461,17 +670,27 @@ channel — the grid never polls REST.
     "temperature": { "value": 24.63, "unit": "°C", "ts": 1789196568081 },
     "humidity": { "value": 51.2, "unit": "%", "ts": 1789196568081 }
   },
-  "sparkline": {
-    "temperature": [{ "ts": 1789196567081, "value": 24.31 }, "…up to 10 points…"],
-    "humidity": [{ "ts": 1789196567081, "value": 50.9 }]
-  }
+  "config": { "sample_rate_ms": 1000, "temp_threshold": 33, "relay_pin": 2 },
+  "config_revision": 3,
+  "config_updated_at": 1789196500000
 }
 ```
 
-`telemetry_update` — one frame per sensor reading (also emitted for MQTT ingest):
+`config` / `config_revision` / `config_updated_at` are what the card's
+`CUSTOM CONFIG rev 3` tag summary renders; a device with nothing saved has `{}` and
+revision `0` (the card shows `no custom config`). Note that `sparkline` is a
+separate field on the same object (last 10 points per sensor, built by the
+`bootstrap` snapshot). The cards no longer draw sparklines (§3.1) — it is still
+served because `bootstrap` also feeds the inspector's chart history, and because
+`GET /api/devices?sparkline=true` remains available to other clients.
+
+`telemetry_update` — one frame per sensor reading (also emitted for MQTT ingest).
+`source` is added to the socket copy only (it is not a column) so the device
+inspector can label the line `HOOK` or `MQTT`:
 
 ```json
-{ "device_id": "ESP32-0006", "sensor_name": "temperature", "value": 24.63, "unit": "°C", "created_at": 1789196568081 }
+{ "device_id": "ESP32-0006", "sensor_name": "temperature", "value": 24.63, "unit": "°C",
+  "created_at": 1789196568081, "source": "http" }
 ```
 
 `device_status` / `device_update` — sent only when a row is new or the liveness
@@ -503,13 +722,16 @@ state flips (so a 220-node fleet does not flood the socket):
 
 ### 7.2 What each event updates on a card
 
-| Event | Card element patched |
+| Event | Where it lands |
 | --- | --- |
-| `telemetry_update` | metric stat block (`[data-metric]`) + its flash, sparkline append, `Updated …` label, heartbeat badge, then the card flash |
-| `device_status` / `device_update` | status dot + badge, IP/MAC/firmware, reorder/insertion (throttled grid reconciliation) |
-| `command_sent` / `…delivered` / `…acked` | relay pill state and the command-queue table |
+| `telemetry_update` | card: headline reading (`[data-role="reading"]`), secondary readings, `Updated …` label, heartbeat badge, then the card flash — **and** if that device is open, the inspector chart point plus a line in its console |
+| `device_status` / `device_update` | card: status dot + badge, IP/MAC/firmware, config tags, reorder/insertion (throttled grid reconciliation, ≤1 re-render / 500 ms) |
+| `device_config` | card config tags + `rev N`; the open inspector's CONFIG tab (unless it holds an unsaved draft, §3.2) |
+| `forward_log` | FORWARDING tab table + counters; a `FWD` line in the device console when it belongs to the open device; other dashboards' cards are untouched |
+| `command_sent` / `…delivered` / `…acked` | inspector command history, the QUEUE tab table, and a `CMD` line in the open device's console |
 | `rule_triggered` | toast, recent-trigger list, `trigger_count`, and the queued command |
-| `terminal` | bottom console line (respects the per-device `LOGS` filter) |
+| `terminal` | system log (settings modal) — mirrored into the device console only for non-telemetry lines (§3.2) |
+| `settings_changed` | FORWARDING tab inputs/status |
 
 ---
 
@@ -894,6 +1116,14 @@ values through `environment:` in `docker-compose.yml`.
 | `TELEMETRY_MAX_ROWS` | `2000000` | hard row cap, oldest trimmed first |
 | `SEED_DEVICE_COUNT` | `220` | demo devices registered on an empty DB (`0` = none) |
 | `RATE_LIMIT_WINDOW_SECONDS` / `RATE_LIMIT_MAX_REQUESTS` | `60` / `600` | per-IP throttle on `/api` |
+| `MAIN_WEBSITE_WEBHOOK_URL` | *(empty)* | upstream site that receives a copy of every telemetry batch (§6.4). Overridable at runtime from the Settings modal |
+| `MAIN_WEBSITE_FORWARD_ENABLED` | `false` | master switch for forwarding (defaults to `true` when a URL is set) |
+| `FORWARD_TIMEOUT_MS` | `8000` | per-attempt upstream timeout |
+| `FORWARD_RETRIES` | `2` | retries after a retryable failure (backoff ×`FORWARD_RETRY_BACKOFF_MS`) |
+| `FORWARD_CONCURRENCY` | `4` | parallel upstream workers |
+| `FORWARD_MAX_QUEUE` | `5000` | queue cap; beyond this the oldest jobs are dropped and counted |
+| `FORWARD_RETRY_BACKOFF_MS` | `1500` | linear backoff step between retries |
+| `FORWARD_MAX_PAYLOAD_BYTES` | `16384` | `raw` payload truncation limit sent upstream |
 
 ---
 
@@ -942,33 +1172,57 @@ battery; CO₂; current) and random-walks around a realistic baseline.
 
 ## 14. Verification performed on this handover
 
+Two passes: the platform (backend, ingest, automation, MQTT, schema) and the
+post-refactor UI (modal design, custom config, upstream forwarding).
+
+**Platform**
+
 | Check | Result |
 | --- | --- |
 | `npm install` (native `better-sqlite3` binding loads) | ✅ |
-| Server boot: schema create, 220 demo devices seeded, 4 default rules | ✅ |
-| Boot with **no** MQTT broker (degrades, keeps serving, retries) | ✅ |
+| Server boot: schema create + migration to v3, 220 demo devices seeded, 4 default rules | ✅ |
+| Boot with **no** MQTT broker (degrades, keeps serving, retries every 4 s) | ✅ |
 | `POST /api/webhook/data` JSON / `sensors{}` / bare `text/plain` | ✅ 201, rows + device upsert |
 | Device auto-registration from first reading; second reading → `online` | ✅ |
-| `GET /api/devices` with latest metrics, search, filters | ✅ |
-| `GET /api/devices/:id/telemetry` series for the chart | ✅ |
+| `GET /api/devices` with latest metrics, search (id / name / ip / mac), filters | ✅ |
+| `GET /api/devices/:id/telemetry` series for the inspector chart | ✅ |
 | Command webhook → SQLite queue → HTTP polling delivery | ✅ |
 | Automation: `temperature=41.5 > 30` → `RELAY_OFF` queued, rule event logged | ✅ |
 | Rule CRUD + toggle + delete + `/api/rule-events` | ✅ |
 | Validation: missing `device_id`, illegal characters, unknown device, unknown route | ✅ 400/404 JSON |
 | Rate limiter / 404 handler / SPA fallback (no path traversal) | ✅ |
 | Simulator: 30 devices → 240 telemetry rows, 19 automation commands, 0 failures | ✅ |
-| Schema migration on a pre-existing v1 database (`user_version` 1 → 2, `devices.mac` added) | ✅ |
-| `mac` accepted from payloads, stored, shown on cards, and searchable via `?search=` | ✅ |
-| Sparkline history: per (device, sensor) series, capped at 10 points, 5-minute window bound | ✅ |
-| Sparkline cost at scale: 39,600-row window → 44.5 ms, 384 KB for 1000 devices (0.2 ms without) | ✅ |
+| Migration on a pre-existing **v1** database (`user_version` 1 → 2 → 3, `devices.mac` added, three new tables created) | ✅ |
+| `mac` accepted from payloads, stored, shown on cards and searchable via `?search=` | ✅ |
+| Sparkline series: per (device, sensor), capped at 10 points, 5-minute window | ✅ |
+| Sparkline cost at scale: 39,600-row window → 44.5 ms / 384 KB for 1000 devices (0.2 ms without) | ✅ |
 | Heartbeat 30 s served by `/api/health` (`offline_after_seconds`) and applied in the browser | ✅ |
-| Headless-Chrome UI run (real socket + Chart.js): 12/12 cards ONLINE, 12/12 sparkline charts initialised, MAC filled 12/12, census `TOTAL: 12 \| ONLINE: 12 \| OFFLINE: 0`, sticky bar, 46 terminal lines, 12 cards flashing live, **0 JS errors** | ✅ |
-| Card quick action → `RELAY_ON` for `ESP32-0006` persisted as `commands` row #5 `source=quick-action`, card pill switched to `RELAY ON` | ✅ |
-| Card `LOGS` action → terminal device-filter chip shows the device id and scopes the stream | ✅ |
-| Filter bar: search `ESP32-000` → census `TOTAL: 9`, `OFFLINE ONLY` → 0 cards, note `showing 0 of 9 matching` | ✅ |
-| `npm run build:css` → 28 kB minified stylesheet with all dynamic classes | ✅ |
+| Settings CRUD + override precedence (`database` > `env` > `unset`) + `DELETE /api/settings/:key` fallback | ✅ |
+| Device config round-trip: `POST` → revision 1 → `GET` returns it; unknown device returns defaults with `has_custom:false` (**not** 404 — the boot path); `DELETE` restores defaults | ✅ |
+| Upstream forwarding: 3/3 batches delivered to a local sink as full documents, `forward_logs` rows written, failures audited with their HTTP status | ✅ |
+| `POST /api/forward/test` → `502` when the remote rejects the probe | ✅ |
+| Ingest latency with a **dead** upstream URL: `POST /api/webhook/data` still 2–3 ms (forwarding is provably off the ingest path) | ✅ |
+| `npm run build:css` → minified stylesheet containing every dynamically used class | ✅ |
 | `docker compose config` validation | ✅ |
 | `docker compose build` / container smoke test | ⏳ pending Docker daemon (`docker-on`) |
+
+**Post-refactor UI** — driven in headless Chrome over the DevTools protocol (real
+DOM, real Chart.js, real socket, live simulated fleet), `59/59` checks passed, run
+twice against a fresh database:
+
+| Check | Result |
+| --- | --- |
+| Main view simplified: global terminal, global chart and command form all absent from the body; both modals start hidden | ✅ |
+| Large cards: 260 px min-height, 3 desktop columns, pointer cursor, and name + id + IP + badge + reading + updated + config tags all present | ✅ |
+| Hover: border `#1E2A34` → `rgba(57,255,20,0.55)` plus an outer neon glow | ✅ |
+| Card click → inspector scoped to that device (header shows its id, IP, MAC, ONLINE) | ✅ |
+| Telemetry tab: four tabs present, only the active panel visible, sensor picker populated, 7+ points plotted for **that** device, canvas painted, min/max/avg readout filled | ✅ |
+| Commands tab: `RELAY_ON` send → `⧗ queued`, row added to history, line written to the device console | ✅ |
+| Config tab: form rows match the saved keys, `SAVE & SYNC TO ESP` reports a revision, revision bumps 1 → 2, value persisted in SQLite | ✅ |
+| Logs tab: stamped with the open device, backfilled history, blinking cursor, PAUSE/CLEAR present, other devices' lines absent, live webhook appended while open | ✅ |
+| Live patching: card DOM node identity preserved, reading updated in place, neon flash fired, badge → ONLINE on heartbeat, `Updated …` refreshed | ✅ |
+| Settings modal: four tabs, forwarding panel renders URL + enable + test + save + logs, save reports `✓ forwarding active · source: database`, value persisted server-side | ✅ |
+| Runtime health: socket connected, **0 uncaught JS errors** | ✅ |
 
 ---
 
@@ -1007,8 +1261,20 @@ battery; CO₂; current) and random-walks around a realistic baseline.
    commit the result whenever markup or class names change.
 4. **Extra endpoints** beyond the brief (`/api/stats`, `/api/rules*`,
    `/api/rule-events`, `/api/devices/:id/telemetry`, `/api/mqtt/status`,
-   `/api/webhook/command/ack`) exist to support the UI and device
-   acknowledgement.
+   `/api/webhook/command/ack`, `/api/settings`, `/api/forward-logs`,
+   `/api/forward/test`) exist to support the UI, the runtime settings layer and
+   device acknowledgement.
+5. **The global telemetry chart, side control panel and global terminal moved into
+   modals.** The brief for this revision asked for a simplified main view, so the
+   body is now only header + stat strip + device cards (§3.1) and those three
+   surfaces live in the device inspector (§3.2) and settings (§3.3) modals. No
+   functionality was dropped — the old anchors were replaced by modal ids
+   (`#device-modal`, `#settings-modal`), which is the one thing to know if you
+   have bookmarked a deep link into the old layout.
+6. **`/api/device/:id/config` never 404s for an unknown device.** It returns the
+   firmware defaults with `has_custom: false`, because a factory-fresh board must
+   be able to provision itself at boot (§6.5). An explicit `DELETE` is how you
+   remove a saved config.
 
 ---
 
@@ -1025,8 +1291,13 @@ battery; CO₂; current) and random-walks around a realistic baseline.
 | Ports already in use | `sudo lsof -i :3000` / `docker compose down` another stack |
 | Terminal panel floods / UI sluggish | reduce ingest rate, use `FOCUS`, or raise `LOG_THROTTLE_MS` in `src/ingest.js` |
 | Rule fires constantly | increase `cooldown_seconds`; the burst limiter caps 25 triggers / 5 s |
-| Charts empty but devices online | only numeric values are charted; non-numeric payloads land in `raw_value` |
-| Cards show no sparkline | by design only cards inside the viewport own a Chart.js chart (`SPARKLINE_BUDGET = 32`); scroll the card into view. If the main chart also fails, check `/vendor/chart.umd.js` loads (`npm run vendor`) |
+| Inspector chart empty but the card shows a reading | only numeric values are charted; non-numeric payloads land in `raw_value`. Also check the sensor picker — the chart follows one series at a time |
+| Chart missing entirely | the vendored library failed to load: check `/vendor/chart.umd.js` (`npm run vendor`) and the browser console |
+| Device console misses lines that the system log shows | expected for non-telemetry lines while `FOCUS` is on elsewhere — but a *gap* in telemetry lines would be a bug: they are pushed from `telemetry_update`, independent of the 25 lines/s system-log throttle (§3.2) |
+| `SAVE & SYNC TO ESP` reports saved but the form reverts | you edited while a background refresh was in flight; the draft guard keeps the newer revision out on purpose (§3.2). Save or reload the device to pick it up |
+| Forwards not arriving upstream | `GET /api/settings` → check `effective.active` and `effective.source`; a runtime row (**database**) overrides `.env`. Use `POST /api/forward/test` to see the remote's HTTP status, and `GET /api/forward-logs` for the per-attempt audit |
+| Forward queue growing / `dropped` increasing | upstream is slow or down: check `failed` and `last_error`, raise `FORWARD_MAX_QUEUE`, or disable forwarding — ingest is never blocked either way |
+| Forwarding goes to the wrong URL | a `settings` row wins over `.env`. `DELETE /api/settings/MAIN_WEBSITE_WEBHOOK_URL` (or clear the field and save) to fall back |
 | Every card reads OFFLINE although data is arriving | heartbeat mismatch: the browser uses `HEARTBEAT_MS` (30 s), the server `OFFLINE_AFTER_SECONDS`. Also check payload `ts`/`timestamp` — a stale or far-future epoch from a device with a wrong clock skews the window |
 | Card metric shows `--` | the sensor only ever sent non-numeric values, so nothing reached `latest_telemetry` |
 | `docker compose up` created an empty `./data` | external drive was not mounted (§10.4) |

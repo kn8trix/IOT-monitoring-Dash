@@ -102,7 +102,7 @@ function handleTelemetry(deviceId, payload) {
 
   for (const reading of result.readings) {
     if (ingest.shouldLogDevice(reading.device_id, reading.sensor_name)) {
-      log('mqtt', 'MQTT', `⇐ ${ingest.summarize(reading)}`);
+      log('mqtt', 'MQTT', `⇐ ${ingest.summarize(reading)}`, ingest.logMeta(reading));
     }
   }
 }
@@ -149,7 +149,10 @@ function publishCommand(command) {
     client.publish(topic, command.payload, { qos: 1, retain: false });
     published += 1;
     db.markCommandDelivered(command.id, 'mqtt');
-    log('command', 'MQTT', `⇒ iot/${command.device_id}/command :: ${command.payload}`);
+    log('command', 'MQTT', `⇒ iot/${command.device_id}/command :: ${command.payload}`, {
+      device_id: command.device_id,
+      command_id: command.id,
+    });
     return true;
   } catch (error) {
     lastError = error.message;

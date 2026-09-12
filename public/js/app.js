@@ -1,6 +1,13 @@
 /* ==========================================================================
    IOT // DASHBOARD — client application
    Vanilla ES2020, no build step. Talks to the server over REST + Socket.io.
+
+   Layout contract
+     · the dashboard body shows ONLY the stats strip and the device card grid
+     · clicking a card opens the DEVICE INSPECTOR modal (chart, commands,
+       custom config, per-device terminal)
+     · fleet-wide admin (upstream forwarding, automation, command queue,
+       system log) lives in the SETTINGS modal, opened from the header
    ========================================================================== */
 
 (() => {
@@ -8,11 +15,10 @@
 
   const NEON = '#39FF14';
   const MAX_CHART_POINTS = 180;
-  const PAGE_SIZE = 24; // rich cards: keep the DOM (and Chart.js instances) light
-  const MINI_POINTS = 10; // sparkline window — "last 10 historical readings"
+  const PAGE_SIZE = 12; // large cards (min-height 260px) — 2/3 columns on desktop
   const MAX_TERMINAL_LINES = 400;
+  const MAX_DEVICE_LOG_LINES = 400;
   const HEARTBEAT_MS = 30_000; // last ping younger than this ⇒ ONLINE
-  const SPARKLINE_BUDGET = 32; // only on-screen cards own a Chart.js instance
 
   const $ = (id) => document.getElementById(id);
 
@@ -21,32 +27,37 @@
     connected: false,
     devices: new Map(), // device_id -> device
     cards: new Map(), // device_id -> card element
-    sparklines: new Map(), // device_id -> { chart, sensor } (on-screen cards only)
-    sparklineObserver: null,
-    relayStates: new Map(), // device_id -> 'ON' | 'OFF' (from card quick actions)
     gridSignature: '',
-    termDevice: null, // terminal focused on one device (card "LOGS" button)
-    selected: null, // device id driving the chart + control panel
     pageCount: 1,
     filter: 'all',
     search: '',
     sort: 'status',
+    stats: null,
+    mqtt: null,
+    settings: null,
     rules: [],
     ruleEvents: [],
     commands: [],
-    chart: {
-      device: null,
+    forwardLogs: [],
+    forwardStats: null,
+    termPaused: false,
+    termFocus: false,
+    termLines: 0,
+    // device inspector
+    device: {
+      id: null,
+      tab: 'telemetry',
       sensor: null,
       points: [],
       live: true,
-      instance: null,
+      chart: null,
+      config: null,
+      configDraft: {},
+      configDirty: false,
+      payloadMode: 'json',
+      logPaused: false,
+      logLines: [],
     },
-    stats: null,
-    mqtt: null,
-    paused: false,
-    focus: false,
-    termLines: 0,
-    cmdMode: 'json',
   };
 
   /* ---------------------------------------------------------------------- */
@@ -66,18 +77,13 @@
     return n.toFixed(2).replace(/\.?0+$/, '') || '0';
   }
 
-  function fmtMetric(metric) {
-    if (!metric || metric.value === null || metric.value === undefined) return '--';
-    return `${fmtNumber(metric.value)}${metric.unit ? ` ${metric.unit}` : ''}`;
-  }
-
   const clockTime = (ts) =>
     new Date(ts).toLocaleTimeString('en-GB', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
   function relTime(ts) {
     if (!ts) return 'never';
     const delta = Math.max(0, Date.now() - ts);
-    if (delta < 1000) return 'now';
+    if (delta < 1000) return 'just now';
     const s = Math.floor(delta / 1000);
     if (s < 60) return `${s}s ago`;
     const m = Math.floor(s / 60);
@@ -98,22 +104,18 @@
     return `${s}s`;
   }
 
-  /** Milliseconds since the last heartbeat; Infinity when never seen. */
   function deviceAge(device) {
     return device && device.last_seen ? Math.max(0, Date.now() - device.last_seen) : Infinity;
   }
 
-  /**
-   * Heartbeat rule for the device cards: a node is ONLINE while its last ping
-   * is younger than HEARTBEAT_MS (30 s). Kept in sync with the server's
-   * OFFLINE_AFTER_SECONDS so the badge flips even between sweeps.
-   */
+  /** Heartbeat rule for the cards: ONLINE while the last ping is < 30 s old. */
   function isOnline(device) {
     return deviceAge(device) < HEARTBEAT_MS;
   }
 
-  function relayState(deviceId) {
-    return state.relayStates.get(deviceId) || null;
+  function updatedLabel(device) {
+    if (!device.last_seen) return 'No ping received';
+    return `Updated ${relTime(device.last_seen)}`;
   }
 
   async function api(path, options = {}) {
@@ -127,9 +129,7 @@
     } catch {
       payload = { ok: false, error: `HTTP ${response.status}` };
     }
-    if (!response.ok || payload.ok === false) {
-      throw new Error(payload.error || `HTTP ${response.status}`);
-    }
+    if (!response.ok || payload.ok === false) throw new Error(payload.error || `HTTP ${response.status}`);
     return payload;
   }
 
@@ -158,16 +158,12 @@
 
   function setConnected(connected) {
     state.connected = connected;
-    const dot = $('socket-dot');
-    const label = $('status-label');
-    const badge = $('socket-badge');
-
-    dot.className = `dot ${connected ? 'dot-online' : 'dot-offline'}`;
-    label.textContent = connected ? 'ACTIVE' : 'DEGRADED';
-    label.className = connected ? 'text-neon glow-text-soft' : 'text-[#ffb020]';
+    $('socket-dot').className = `dot ${connected ? 'dot-online' : 'dot-offline'}`;
+    $('status-label').textContent = connected ? 'ACTIVE' : 'DEGRADED';
+    $('status-label').className = connected ? 'text-neon glow-text-soft' : 'text-[#ffb020]';
     $('status-dot').className = `dot ${connected ? 'dot-online' : 'dot-stale'}`;
     $('socket-label').textContent = connected ? 'LINK: LIVE' : 'LINK: LOST';
-    badge.classList.toggle('glow-border', connected);
+    $('socket-badge').classList.toggle('glow-border', connected);
   }
 
   function renderMqtt(status) {
@@ -194,32 +190,52 @@
   function renderStats(stats) {
     if (!stats) return;
     state.stats = stats;
+    const configured = [...state.devices.values()].filter((d) => d.config_revision > 0).length;
+
     $('stat-total').textContent = stats.devices.total;
     $('stat-online').textContent = stats.devices.online;
     $('stat-offline').textContent = stats.devices.offline;
     $('stat-rate').textContent = stats.telemetry.last_minute;
-    $('stat-rows').textContent = stats.telemetry.total.toLocaleString('en-US');
+    $('stat-configured').textContent = configured;
     $('stat-pending').textContent = stats.commands.pending;
-    $('stat-rules').textContent = `${stats.rules.enabled}/${stats.rules.total}`;
+    $('stat-forwarded').textContent = stats.forward_stats ? stats.forward_stats.success : (stats.forward?.delivered ?? 0);
     $('stat-uptime').textContent = fmtUptime(stats.uptime_seconds);
 
     $('header-online').textContent = stats.devices.online;
     $('header-total').textContent = stats.devices.total;
     $('header-rate').textContent = stats.telemetry.last_minute;
-    $('header-clients').textContent = stats.clients ?? 0;
+
+    if (stats.forward) renderForwardStatus(stats.forward, stats.forward_stats);
   }
 
   /* ---------------------------------------------------------------------- */
-  /* Devices                                                                */
+  /* Device grid                                                            */
   /* ---------------------------------------------------------------------- */
 
   function upsertDevice(device) {
-    if (!device || !device.device_id) return;
+    if (!device || !device.device_id) return null;
     const previous = state.devices.get(device.device_id);
     const merged = previous ? { ...previous, ...device } : device;
     if (previous && previous.metrics) merged.metrics = { ...previous.metrics, ...(device.metrics || {}) };
+    // device_status frames never carry the saved config — keep what we have.
+    if (previous && previous.config && !device.config) {
+      merged.config = previous.config;
+      merged.config_revision = previous.config_revision;
+      merged.config_updated_at = previous.config_updated_at;
+    }
     state.devices.set(device.device_id, merged);
     return merged;
+  }
+
+  /** Sensor shown as the single large reading on a card / in the modal. */
+  function primarySensor(device) {
+    const sensors = Object.keys(device.metrics || {});
+    if (!sensors.length) return null;
+    return sensors.includes('temperature') ? 'temperature' : sensors.sort()[0];
+  }
+
+  function metricLabel(name) {
+    return String(name).replace(/_/g, ' ').toUpperCase();
   }
 
   function sortDevices(list) {
@@ -234,10 +250,6 @@
     return list.sort(sorters[state.sort] || sorters.status);
   }
 
-  /**
-   * Search-scoped device list (status filter NOT applied). This is the census
-   * scope for the "Total | Online | Offline" counter in the filter bar.
-   */
   function matchingDevices() {
     const term = state.search.trim().toLowerCase();
     const list = [...state.devices.values()];
@@ -251,7 +263,6 @@
     return sortDevices(filtered);
   }
 
-  /** Search + status filter, truncated to the current page (LOAD MORE). */
   function renderedDevices(matching) {
     const byStatus =
       state.filter === 'online'
@@ -262,7 +273,7 @@
     return byStatus.slice(0, state.pageCount * PAGE_SIZE);
   }
 
-  /** Live counter: "TOTAL: X | ONLINE: Y | OFFLINE: Z". */
+  /** "TOTAL: X | ONLINE: Y | OFFLINE: Z" census in the sticky filter bar. */
   function renderCensus(matching) {
     const online = matching.filter(isOnline).length;
     const offline = matching.length - online;
@@ -272,57 +283,34 @@
       `<span class="text-[#2d4a44]"> | </span><span class="text-[#6d8b84]">OFFLINE:</span> <b class="${offline ? 'text-[#ff7b72]' : 'text-[#6d8b84]'}">${offline}</b>`;
   }
 
-  function metricEntries(device) {
-    return Object.entries(device.metrics || {})
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .slice(0, 3);
-  }
-
-  /** Sensor whose history drives the card sparkline (temperature when present). */
-  function primarySensor(device) {
-    const sensors = Object.keys(device.metrics || {});
-    if (!sensors.length) return null;
-    return sensors.includes('temperature') ? 'temperature' : sensors.sort()[0];
-  }
-
-  function updatedLabel(device) {
-    if (!device.last_seen) return 'No ping received';
-    return `Updated ${relTime(device.last_seen)}`;
-  }
-
-  function timestampTitle(device) {
-    return device.last_seen ? new Date(device.last_seen).toLocaleString() : 'never reported';
-  }
-
-  /** The high-contrast stat blocks shown on every card. */
-  function metricBlocks(device) {
-    const metrics = metricEntries(device);
-    if (!metrics.length) {
-      return '<div class="metric-block"><p class="metric-label">awaiting data</p><p class="metric-value">--</p></div>';
-    }
-    return metrics
-      .map(
-        ([name, metric]) => `
-      <div class="metric-block">
-        <p class="metric-label" title="${esc(name)}">${esc(name.replace(/_/g, ' '))}</p>
-        <p class="metric-value"><span data-metric="${esc(name)}">${esc(fmtNumber(metric.value))}</span>${
-          metric.unit ? `<span class="metric-unit">${esc(metric.unit)}</span>` : ''
-        }</p>
-      </div>`,
-      )
-      .join('');
+  /** Summary tags of the device's saved custom config. */
+  function configTags(device) {
+    const entries = Object.entries(device.config || {});
+    if (!entries.length) return '<span class="config-tag config-tag-none">no custom config</span>';
+    const shown = entries.slice(0, 3).map(
+      ([key, value]) =>
+        `<span class="config-tag" title="${esc(key)}=${esc(JSON.stringify(value))}">${esc(key)}
+           <b class="text-[#d9ffcf]">${esc(typeof value === 'boolean' ? String(value) : JSON.stringify(value))}</b></span>`,
+    );
+    if (entries.length > 3) shown.push(`<span class="config-tag">+${entries.length - 3}</span>`);
+    return shown.join('');
   }
 
   function cardInner(device) {
     const online = isOnline(device);
-    const relay = relayState(device.device_id);
     const sensor = primarySensor(device);
+    const primary = sensor ? (device.metrics || {})[sensor] : null;
+    const others = Object.entries(device.metrics || {})
+      .filter(([name]) => name !== sensor)
+      .slice(0, 3)
+      .map(([name, metric]) => `${esc(name)} ${esc(fmtNumber(metric.value))}${metric.unit ? ` ${esc(metric.unit)}` : ''}`)
+      .join(' · ');
 
     return `
       <header class="flex items-start gap-2">
         <div class="min-w-0 flex-1">
-          <p class="device-name" title="${esc(device.name || device.device_id)}">${esc(device.name || device.device_id)}</p>
-          <p class="device-id" title="device id">${esc(device.device_id)}</p>
+          <h3 class="device-name" title="${esc(device.name || device.device_id)}">${esc(device.name || device.device_id)}</h3>
+          <p class="device-id">${esc(device.device_id)}</p>
         </div>
         <span class="status-badge ${online ? 'status-online' : 'status-offline'}" data-role="badge">
           <span class="dot ${online ? 'dot-online' : 'dot-offline'}" data-role="dot"></span>
@@ -330,44 +318,40 @@
         </span>
       </header>
 
-      <dl class="mt-1.5 space-y-0.5 text-[0.6rem] text-[#5d7b75]">
-        <div class="flex gap-1.5">
-          <dt class="w-[2.1rem] flex-none text-[#3f5b55]">IP</dt>
-          <dd class="truncate" data-role="ip">${esc(device.ip || '—')}</dd>
-        </div>
-        <div class="flex gap-1.5">
-          <dt class="w-[2.1rem] flex-none text-[#3f5b55]">MAC</dt>
-          <dd class="truncate" data-role="mac">${esc(device.mac || '—')}</dd>
-        </div>
-      </dl>
+      <p class="text-[0.63rem] text-[#6d8b84]">
+        IP <b class="text-[#9fd8b4]" data-role="ip">${esc(device.ip || '—')}</b>
+        <span class="text-[#33504a]">·</span> ${esc(device.location || 'unassigned')}
+      </p>
+      <p class="text-[0.6rem] text-[#47605a]">MAC <span data-role="mac">${esc(device.mac || '—')}</span></p>
 
-      <div class="mt-2 grid grid-cols-3 gap-1.5" data-role="metrics">${metricBlocks(device)}</div>
-
-      <div class="sparkline-box mt-2">
-        <canvas data-role="sparkline" aria-label="Sparkline for ${esc(device.device_id)}"></canvas>
-        <span class="sparkline-label" data-role="sparkline-label">${esc(sensor || 'no series')}</span>
+      <div class="mt-1">
+        <p class="metric-label" data-role="reading-label">${esc(sensor ? metricLabel(sensor) : 'AWAITING DATA')}</p>
+        <p class="reading-value"><span data-role="reading">${esc(primary ? fmtNumber(primary.value) : '--')}</span>${
+          primary && primary.unit ? `<span class="reading-unit" data-role="reading-unit">${esc(primary.unit)}</span>` : ''
+        }</p>
+        <p class="reading-secondary" data-role="secondary">${others || (primary ? '' : 'no readings received yet')}</p>
       </div>
 
-      <div class="mt-1.5 flex items-center gap-2 text-[0.6rem] text-[#47605a]">
-        <span data-role="seen" title="${esc(timestampTitle(device))}">${esc(updatedLabel(device))}</span>
-        <span class="relay-pill ${relay === 'ON' ? 'is-on' : ''}" data-role="relay">RELAY ${esc(relay || '—')}</span>
-        <span class="ml-auto truncate" data-role="fw">${esc(device.firmware || 'fw ?')}</span>
+      <div class="mt-auto">
+        <p class="metric-label mb-0.5">CUSTOM CONFIG <span class="text-[#33504a]" data-role="config-rev">${
+          device.config_revision ? `rev ${device.config_revision}` : ''
+        }</span></p>
+        <div class="flex flex-wrap gap-1" data-role="config-tags">${configTags(device)}</div>
       </div>
 
-      <div class="mt-2 flex items-center gap-1.5">
-        <button class="btn btn-relay ${relay === 'ON' ? 'is-active' : ''} flex-1" data-relay="RELAY_ON" type="button"
-                title="Send RELAY_ON to ${esc(device.device_id)}">RELAY ON</button>
-        <button class="btn btn-relay ${relay === 'OFF' ? 'is-active' : ''} flex-1" data-relay="RELAY_OFF" type="button"
-                title="Send RELAY_OFF to ${esc(device.device_id)}">RELAY OFF</button>
-        <button class="btn btn-relay px-2" data-logs="1" type="button"
-                title="Show only this device in the terminal">LOGS</button>
-      </div>`;
+      <footer class="flex items-center gap-2 border-t border-edge pt-2 text-[0.6rem] text-[#47605a]">
+        <span data-role="seen">${esc(updatedLabel(device))}</span>
+        <span class="ml-auto text-neon glow-text-soft">OPEN ▸</span>
+      </footer>`;
   }
 
   function createCard(device) {
-    const card = document.createElement('div');
+    const card = document.createElement('article');
     card.className = 'device-card';
     card.dataset.device = device.device_id;
+    card.tabIndex = 0;
+    card.setAttribute('role', 'button');
+    card.setAttribute('aria-label', `Open inspector for ${device.device_id}`);
     card.innerHTML = cardInner(device);
     applyCardState(card, device);
     return card;
@@ -375,174 +359,26 @@
 
   function applyCardState(card, device) {
     const online = isOnline(device);
-    const relay = relayState(device.device_id);
-
     card.classList.toggle('is-online', online);
     card.classList.toggle('is-offline', !online);
-    card.classList.toggle('is-selected', state.selected === device.device_id);
 
     const dot = card.querySelector('[data-role="dot"]');
     if (dot) dot.className = `dot ${online ? 'dot-online' : 'dot-offline'}`;
-
     const badge = card.querySelector('[data-role="badge"]');
     if (badge) badge.className = `status-badge ${online ? 'status-online' : 'status-offline'}`;
-
     const status = card.querySelector('[data-role="status"]');
     if (status) status.textContent = online ? 'ONLINE' : 'OFFLINE';
-
-    const pill = card.querySelector('[data-role="relay"]');
-    if (pill) {
-      pill.textContent = `RELAY ${relay || '—'}`;
-      pill.classList.toggle('is-on', relay === 'ON');
-    }
-
-    for (const button of card.querySelectorAll('[data-relay]')) {
-      button.classList.toggle('is-active', relay === button.dataset.relay.replace('RELAY_', ''));
-    }
   }
 
-  /** Brief neon border pulse marking a card that just received data. */
+  /** ~0.9 s neon border pulse marking a card that just received data. */
   function flashCard(card) {
     card.classList.remove('card-live-flash');
-    void card.offsetWidth; // force a reflow so the animation restarts
+    void card.offsetWidth;
     card.classList.add('card-live-flash');
     clearTimeout(card._flashTimer);
     card._flashTimer = setTimeout(() => card.classList.remove('card-live-flash'), 950);
   }
 
-  /* ---- card sparklines --------------------------------------------------- */
-  /*
-   * One Chart.js line chart per card would be far too heavy for a 200+ node
-   * fleet, so charts are created lazily: only cards inside (or near) the
-   * viewport own an instance, capped at SPARKLINE_BUDGET. Scrolling a card out
-   * of view destroys its chart.
-   */
-
-  function sparklineSeries(device) {
-    const sensor = primarySensor(device);
-    const series = (sensor && device.sparkline && device.sparkline[sensor]) || [];
-    return { sensor, points: series.map((point) => point.value) };
-  }
-
-  function initSparklineObserver() {
-    if (typeof IntersectionObserver === 'undefined') return;
-    state.sparklineObserver = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          const deviceId = entry.target.dataset.device;
-          if (!deviceId) continue;
-          if (entry.isIntersecting) {
-            if (state.sparklines.has(deviceId) || state.sparklines.size >= SPARKLINE_BUDGET) continue;
-            createSparkline(deviceId, entry.target);
-          } else {
-            destroySparkline(deviceId);
-          }
-        }
-      },
-      { rootMargin: '120px 0px' },
-    );
-  }
-
-  function createSparkline(deviceId, card) {
-    if (state.sparklines.has(deviceId) || typeof Chart === 'undefined') return;
-    const device = state.devices.get(deviceId);
-    const canvas = card.querySelector('[data-role="sparkline"]');
-    if (!device || !canvas) return;
-
-    const { sensor, points } = sparklineSeries(device);
-    const chart = new Chart(canvas.getContext('2d'), {
-      type: 'line',
-      data: {
-        labels: points.map(() => ''),
-        datasets: [
-          {
-            data: points.slice(),
-            borderColor: NEON,
-            borderWidth: 1.6,
-            pointRadius: 0,
-            pointHoverRadius: 0,
-            tension: 0.35,
-            spanGaps: true,
-            fill: true,
-            backgroundColor: (context) => {
-              const { ctx, chartArea } = context.chart;
-              if (!chartArea) return 'rgba(57,255,20,0.10)';
-              const gradient = ctx.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
-              gradient.addColorStop(0, 'rgba(57,255,20,0.34)');
-              gradient.addColorStop(1, 'rgba(57,255,20,0)');
-              return gradient;
-            },
-          },
-        ],
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        animation: false,
-        layout: { padding: 1 },
-        scales: { x: { display: false }, y: { display: false, grace: '18%' } },
-        plugins: { legend: { display: false }, tooltip: { enabled: false } },
-      },
-    });
-
-    state.sparklines.set(deviceId, { chart, sensor });
-  }
-
-  function destroySparkline(deviceId) {
-    const entry = state.sparklines.get(deviceId);
-    if (!entry) return;
-    try {
-      entry.chart.destroy();
-    } catch {
-      /* already disposed */
-    }
-    state.sparklines.delete(deviceId);
-  }
-
-  function destroyAllSparklines() {
-    for (const deviceId of [...state.sparklines.keys()]) destroySparkline(deviceId);
-  }
-
-  function observeSparklines() {
-    if (!state.sparklineObserver) return;
-    state.sparklineObserver.disconnect();
-    for (const [, card] of state.cards) state.sparklineObserver.observe(card);
-  }
-
-  /** Immediately charts the cards that are already in view (first paint). */
-  function createVisibleSparklines() {
-    for (const [deviceId, card] of state.cards) {
-      if (state.sparklines.size >= SPARKLINE_BUDGET) break;
-      const rect = card.getBoundingClientRect();
-      if (rect.bottom > -120 && rect.top < window.innerHeight + 120) createSparkline(deviceId, card);
-    }
-  }
-
-  /** Append the newest sample to a card's sparkline (keeps only MINI_POINTS). */
-  function pushSparkline(deviceId, card, device, sensor) {
-    const entry = state.sparklines.get(deviceId);
-    if (!entry || !sensor) return;
-
-    if (entry.sensor !== sensor) {
-      // The card's primary series changed (e.g. temperature just arrived).
-      destroySparkline(deviceId);
-      createSparkline(deviceId, card);
-      return;
-    }
-
-    const metric = (device.metrics || {})[sensor];
-    if (!metric || !Number.isFinite(Number(metric.value))) return;
-
-    const data = entry.chart.data.datasets[0].data;
-    const labels = entry.chart.data.labels;
-    data.push(Number(metric.value));
-    labels.push('');
-    if (data.length > MINI_POINTS) data.splice(0, data.length - MINI_POINTS);
-    if (labels.length > MINI_POINTS) labels.splice(0, labels.length - MINI_POINTS);
-    entry.chart.update('none');
-  }
-
-  /** Full re-render of the grid (filters, sort, search, first paint). */
   function renderGrid({ keepPage = false } = {}) {
     if (!keepPage) state.pageCount = 1;
 
@@ -550,7 +386,6 @@
     const list = renderedDevices(matching);
     const grid = $('device-grid');
 
-    destroyAllSparklines();
     grid.textContent = '';
     state.cards.clear();
 
@@ -565,25 +400,13 @@
 
     renderCensus(matching);
     $('device-grid-note').textContent = matching.length
-      ? `showing ${list.length} of ${matching.length} matching · ${state.devices.size} registered · heartbeat < ${HEARTBEAT_MS / 1000}s`
+      ? `showing ${list.length} of ${matching.length} matching · ${state.devices.size} registered · heartbeat < ${HEARTBEAT_MS / 1000}s · click a card to inspect`
       : 'no devices match the current filter';
     $('device-more').classList.toggle('hidden', list.length >= matching.length);
-
-    // Keep the device dropdown in sync (top 300 is plenty for a picker).
-    const options = matching.slice(0, 300).map((d) => `<option value="${esc(d.device_id)}"></option>`).join('');
-    $('device-options').innerHTML = options;
-    syncChartDeviceSelect(list);
-
-    observeSparklines();
-    createVisibleSparklines();
   }
 
-  /**
-   * In-place update of a single card — metric values, sparkline, last-ping
-   * label, status badge and the neon flash. The grid is never re-rendered for
-   * a plain telemetry frame.
-   */
-  function updateCard(deviceId, changedMetric, { flash = true } = {}) {
+  /** In-place patch of one card — no page re-render for a telemetry frame. */
+  function updateCard(deviceId, { flash = true } = {}) {
     const card = state.cards.get(deviceId);
     const device = state.devices.get(deviceId);
     if (!device || !card) return;
@@ -591,56 +414,47 @@
     applyCardState(card, device);
 
     const seen = card.querySelector('[data-role="seen"]');
-    if (seen) {
-      seen.textContent = updatedLabel(device);
-      seen.title = timestampTitle(device);
-    }
+    if (seen) seen.textContent = updatedLabel(device);
     const ip = card.querySelector('[data-role="ip"]');
-    if (ip && device.ip) ip.textContent = device.ip;
+    if (ip) ip.textContent = device.ip || '—';
     const mac = card.querySelector('[data-role="mac"]');
-    if (mac && device.mac) mac.textContent = device.mac;
-    const fw = card.querySelector('[data-role="fw"]');
-    if (fw && device.firmware) fw.textContent = device.firmware;
-
-    // Metric blocks: only re-render the row when the sensor set itself changed.
-    const container = card.querySelector('[data-role="metrics"]');
-    const metrics = metricEntries(device);
-    if (container) {
-      const rendered = [...container.querySelectorAll('[data-metric]')].map((node) => node.dataset.metric).join('|');
-      const wanted = metrics.map(([name]) => name).join('|');
-      if (rendered !== wanted) {
-        container.innerHTML = metricBlocks(device);
-      } else {
-        for (const [name, metric] of metrics) {
-          const node = container.querySelector(`[data-metric="${CSS.escape(name)}"]`);
-          if (!node) continue;
-          const next = fmtNumber(metric.value);
-          if (node.textContent !== next) {
-            node.textContent = next;
-            if (name === changedMetric) {
-              node.classList.remove('flash-value');
-              void node.offsetWidth;
-              node.classList.add('flash-value');
-            }
-          }
-        }
-      }
-    }
+    if (mac) mac.textContent = device.mac || '—';
 
     const sensor = primarySensor(device);
-    const label = card.querySelector('[data-role="sparkline-label"]');
-    if (label) label.textContent = sensor || 'no series';
-    if (sensor && changedMetric === sensor) pushSparkline(deviceId, card, device, sensor);
+    const primary = sensor ? (device.metrics || {})[sensor] : null;
+
+    const label = card.querySelector('[data-role="reading-label"]');
+    const reading = card.querySelector('[data-role="reading"]');
+    const unit = card.querySelector('[data-role="reading-unit"]');
+    if (label) label.textContent = sensor ? metricLabel(sensor) : 'AWAITING DATA';
+    if (reading) {
+      const next = primary ? fmtNumber(primary.value) : '--';
+      if (reading.textContent !== next) {
+        reading.textContent = next;
+        reading.classList.remove('flash-value');
+        void reading.offsetWidth;
+        reading.classList.add('flash-value');
+      }
+    }
+    if (unit && primary && primary.unit) unit.textContent = primary.unit;
+
+    const secondary = card.querySelector('[data-role="secondary"]');
+    if (secondary) {
+      secondary.textContent = Object.entries(device.metrics || {})
+        .filter(([name]) => name !== sensor)
+        .slice(0, 3)
+        .map(([name, metric]) => `${name} ${fmtNumber(metric.value)}${metric.unit ? ` ${metric.unit}` : ''}`)
+        .join(' · ');
+    }
+
+    const tags = card.querySelector('[data-role="config-tags"]');
+    if (tags) tags.innerHTML = configTags(device);
+    const rev = card.querySelector('[data-role="config-rev"]');
+    if (rev) rev.textContent = device.config_revision ? `rev ${device.config_revision}` : '';
 
     if (flash) flashCard(card);
   }
 
-  /**
-   * Throttled reconciliation, used when an event arrives for a device that is
-   * not currently on screen. If the visible set changed (a node came online,
-   * a filter now matches it) the grid is re-rendered; otherwise the existing
-   * cards are refreshed in place.
-   */
   let gridRefreshTimer = null;
   function scheduleGridRefresh() {
     if (gridRefreshTimer) return;
@@ -653,14 +467,10 @@
         return;
       }
       renderCensus(matching);
-      for (const device of list) updateCard(device.device_id, null, { flash: false });
+      for (const device of list) updateCard(device.device_id, { flash: false });
     }, 500);
   }
 
-  /**
-   * Re-evaluates the <30 s heartbeat rule and the "Updated …" labels. This is
-   * what flips a badge to OFFLINE without waiting for a server sweep.
-   */
   function refreshHeartbeats() {
     for (const [deviceId, card] of state.cards) {
       const device = state.devices.get(deviceId);
@@ -670,116 +480,139 @@
       if (seen) seen.textContent = updatedLabel(device);
     }
     if (state.cards.size) renderCensus(matchingDevices());
+    if (state.device.id) renderDeviceHead();
   }
 
   /* ---------------------------------------------------------------------- */
-  /* Selecting a device                                                     */
+  /* Modal plumbing                                                         */
   /* ---------------------------------------------------------------------- */
 
-  function selectDevice(deviceId, { sensorName } = {}) {
+  function openModal(id) {
+    const modal = $(id);
+    modal.classList.remove('hidden');
+    modal.classList.add('fade-in');
+    document.body.style.overflow = 'hidden';
+  }
+
+  function closeModal(id) {
+    $(id).classList.add('hidden');
+    if ($('device-modal').classList.contains('hidden') && $('settings-modal').classList.contains('hidden')) {
+      document.body.style.overflow = '';
+    }
+  }
+
+  function closeAllModals() {
+    closeModal('device-modal');
+    closeModal('settings-modal');
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* DEVICE INSPECTOR                                                       */
+  /* ---------------------------------------------------------------------- */
+
+  function openDevice(deviceId) {
     const device = state.devices.get(deviceId);
     if (!device) {
       toast(`unknown device: ${deviceId}`, 'warn');
       return;
     }
-    state.selected = deviceId;
-    state.chart.device = deviceId;
 
-    const previous = state.cards.get(deviceId);
-    if (previous) applyCardState(previous, device);
-    for (const [id, card] of state.cards) {
-      if (id !== deviceId) card.classList.remove('is-selected');
+    const d = state.device;
+    d.id = deviceId;
+    d.points = [];
+    d.logLines = [];
+    d.logPaused = false;
+    d.payloadMode = 'json';
+    // fresh inspector for a fresh device — no unsaved draft carries over
+    d.configDirty = false;
+    d.configDraft = {};
+    $('dm-config-result').textContent = '';
+
+    destroyDeviceChart();
+    renderDeviceHead();
+    document.querySelectorAll('[data-modal-tab]').forEach((tab) => tab.classList.toggle('is-active', tab.dataset.modalTab === 'telemetry'));
+    showDeviceTab('telemetry');
+
+    $('dm-log-device').textContent = deviceId;
+    $('dm-terminal').querySelectorAll('.term-line').forEach((line) => line.remove());
+    $('dm-log-count').textContent = '0 LINES';
+    $('dm-result').textContent = '';
+    $('dm-config-result').textContent = '';
+    $('dm-payload').value = '';
+    $('dm-payload-hint').textContent = 'JSON payloads are validated before sending.';
+
+    renderSensorOptions();
+    initDeviceChart();
+    loadDeviceSeries();
+    loadDeviceDetail();
+    renderDeviceCommands([]);
+
+    // Backfill the device console from the REST history before the live stream
+    // takes over (telemetry + command rows are both useful in the log).
+    backfillDeviceLog(deviceId);
+
+    openModal('device-modal');
+  }
+
+  function closeDevice() {
+    destroyDeviceChart();
+    state.device.id = null;
+    closeModal('device-modal');
+  }
+
+  function renderDeviceHead() {
+    const device = state.devices.get(state.device.id);
+    if (!device) return;
+    const online = isOnline(device);
+
+    $('dm-title').textContent = device.name || device.device_id;
+    $('dm-subtitle').textContent = [
+      device.device_id,
+      device.ip ? `IP ${device.ip}` : null,
+      device.mac ? `MAC ${device.mac}` : null,
+      device.location,
+    ]
+      .filter(Boolean)
+      .join(' · ');
+
+    $('dm-dot').className = `dot ${online ? 'dot-online' : 'dot-offline'}`;
+    $('dm-badge').className = `status-badge ${online ? 'status-online' : 'status-offline'}`;
+    $('dm-status').textContent = online ? 'ONLINE' : 'OFFLINE';
+
+    $('dm-last-ping').textContent = device.last_seen ? relTime(device.last_seen) : 'never';
+    $('dm-location').textContent = device.location || '—';
+    $('dm-firmware').textContent = device.firmware || '—';
+    $('dm-config-rev').textContent = device.config_revision ? `rev ${device.config_revision}` : 'none';
+  }
+
+  function showDeviceTab(name) {
+    state.device.tab = name;
+    document.querySelectorAll('[data-modal-tab]').forEach((tab) => tab.classList.toggle('is-active', tab.dataset.modalTab === name));
+    document.querySelectorAll('[data-tab-panel]').forEach((panel) => panel.classList.toggle('hidden', panel.dataset.tabPanel !== name));
+    if (name === 'telemetry') {
+      // The canvas has just been (re)displayed: let Chart.js measure it again.
+      requestAnimationFrame(() => state.device.chart && state.device.chart.resize());
     }
-
-    $('cmd-device').value = deviceId;
-    $('cmd-target-hint').innerHTML = `<span class="text-neon">target:</span> ${esc(deviceId)} · ${esc(device.location || 'unassigned')} · <span class="${
-      device.status === 'online' ? 'text-neon' : 'text-[#6d8b84]'
-    }">${device.status || 'offline'}</span>`;
-
-    const sensors = Object.keys(device.metrics || {});
-    $('chart-device').value = deviceId;
-    renderSensorOptions(sensors, sensorName || state.chart.sensor);
-    loadChartSeries();
   }
 
-  /* ---------------------------------------------------------------------- */
-  /* Chart                                                                  */
-  /* ---------------------------------------------------------------------- */
+  function renderSensorOptions() {
+    const device = state.devices.get(state.device.id);
+    const sensors = Object.keys((device && device.metrics) || {});
+    const list = sensors.length ? sensors : ['temperature'];
+    const select = $('dm-sensor');
+    select.innerHTML = list.map((sensor) => `<option value="${esc(sensor)}">${esc(sensor)}</option>`).join('');
+    $('sensor-options').innerHTML = list.map((sensor) => `<option value="${esc(sensor)}"></option>`).join('');
 
-  function syncChartDeviceSelect(list) {
-    const select = $('chart-device');
-    if (document.activeElement === select) return;
-    const current = state.chart.device;
-    const options = list
-      .filter((d) => d.status === 'online' || Object.keys(d.metrics || {}).length)
-      .slice(0, 300)
-      .map((d) => `<option value="${esc(d.device_id)}">${esc(d.device_id)}</option>`)
-      .join('');
-    if (select.dataset.signature !== options) {
-      select.dataset.signature = options;
-      select.innerHTML = options || '<option value="">no devices online</option>';
-    }
-    if (current) select.value = current;
+    const wanted = state.device.sensor && list.includes(state.device.sensor) ? state.device.sensor : (sensors.includes('temperature') ? 'temperature' : list[0]);
+    state.device.sensor = wanted;
+    select.value = wanted;
   }
 
-  function renderSensorOptions(sensors, preferred) {
-    const select = $('chart-sensor');
-    const list = sensors && sensors.length ? sensors : ['temperature'];
-    const signature = list.join('|') + `#${preferred || ''}`;
-    if (select.dataset.signature !== signature) {
-      select.dataset.signature = signature;
-      select.innerHTML = list.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
-      $('sensor-options').innerHTML = list.map((s) => `<option value="${esc(s)}"></option>`).join('');
-    }
-    const next = list.includes(preferred) ? preferred : list[0];
-    state.chart.sensor = next;
-    select.value = next;
-  }
-
-  function chartOptions() {
-    return {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: false,
-      interaction: { mode: 'index', intersect: false },
-      layout: { padding: { top: 8, right: 8, bottom: 0, left: 0 } },
-      scales: {
-        x: {
-          grid: { color: 'rgba(30,42,52,0.55)', drawTicks: false },
-          border: { color: '#1E2A34' },
-          ticks: { color: '#4d6a63', font: { family: 'monospace', size: 10 }, maxRotation: 0, autoSkipPadding: 24 },
-        },
-        y: {
-          grid: { color: 'rgba(30,42,52,0.55)', drawTicks: false },
-          border: { color: '#1E2A34' },
-          ticks: { color: '#4d6a63', font: { family: 'monospace', size: 10 } },
-        },
-      },
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          backgroundColor: '#0B0F12',
-          borderColor: '#39FF14',
-          borderWidth: 1,
-          titleColor: '#39FF14',
-          bodyColor: '#d9ffcf',
-          displayColors: false,
-          titleFont: { family: 'monospace', size: 11 },
-          bodyFont: { family: 'monospace', size: 12 },
-        },
-      },
-      elements: {
-        line: { tension: 0.32, borderWidth: 2 },
-        point: { radius: 0, hitRadius: 12, hoverRadius: 3 },
-      },
-    };
-  }
-
-  function initChart() {
-    const canvas = $('telemetry-chart');
+  function initDeviceChart() {
+    const canvas = $('device-chart');
     if (!canvas || typeof Chart === 'undefined') return;
 
-    state.chart.instance = new Chart(canvas.getContext('2d'), {
+    state.device.chart = new Chart(canvas.getContext('2d'), {
       type: 'line',
       data: {
         labels: [],
@@ -789,182 +622,172 @@
             data: [],
             borderColor: NEON,
             borderWidth: 2,
-            pointBackgroundColor: NEON,
+            pointRadius: 0,
+            pointHoverRadius: 4,
+            tension: 0.32,
+            spanGaps: true,
             fill: true,
             backgroundColor: (context) => {
               const { ctx, chartArea } = context.chart;
               if (!chartArea) return 'rgba(57,255,20,0.12)';
               const gradient = ctx.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
               gradient.addColorStop(0, 'rgba(57,255,20,0.34)');
-              gradient.addColorStop(0.45, 'rgba(57,255,20,0.12)');
+              gradient.addColorStop(0.5, 'rgba(57,255,20,0.12)');
               gradient.addColorStop(1, 'rgba(57,255,20,0)');
               return gradient;
             },
           },
         ],
       },
-      options: chartOptions(),
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: { mode: 'index', intersect: false },
+        scales: {
+          x: {
+            grid: { color: 'rgba(30,42,52,0.55)', drawTicks: false },
+            border: { color: '#1E2A34' },
+            ticks: { color: '#4d6a63', font: { family: 'monospace', size: 10 }, maxRotation: 0, autoSkipPadding: 24 },
+          },
+          y: {
+            grid: { color: 'rgba(30,42,52,0.55)', drawTicks: false },
+            border: { color: '#1E2A34' },
+            ticks: { color: '#4d6a63', font: { family: 'monospace', size: 10 } },
+          },
+        },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: '#0B0F12',
+            borderColor: NEON,
+            borderWidth: 1,
+            titleColor: NEON,
+            bodyColor: '#d9ffcf',
+            displayColors: false,
+            titleFont: { family: 'monospace', size: 11 },
+            bodyFont: { family: 'monospace', size: 12 },
+          },
+        },
+      },
     });
   }
 
-  function chartPush(point) {
-    const chart = state.chart.instance;
-    if (!chart) return;
-    chart.data.labels.push(clockTime(point.ts));
-    chart.data.datasets[0].data.push(point.value);
-    if (chart.data.labels.length > MAX_CHART_POINTS) {
-      chart.data.labels.splice(0, chart.data.labels.length - MAX_CHART_POINTS);
-      chart.data.datasets[0].data.splice(0, chart.data.datasets[0].data.length - MAX_CHART_POINTS);
+  function destroyDeviceChart() {
+    if (state.device.chart) {
+      try {
+        state.device.chart.destroy();
+      } catch {
+        /* already gone */
+      }
+      state.device.chart = null;
     }
-    chart.update('none');
-    updateChartSummary();
   }
 
-  function setChartSeries(points) {
-    const chart = state.chart.instance;
+  function setDeviceSeries(points) {
+    const chart = state.device.chart;
     if (!chart) return;
-    state.chart.points = points.slice(-MAX_CHART_POINTS);
-    chart.data.labels = state.chart.points.map((p) => clockTime(p.ts));
-    chart.data.datasets[0].data = state.chart.points.map((p) => p.value);
+    state.device.points = points.slice(-MAX_CHART_POINTS);
+    chart.data.labels = state.device.points.map((point) => clockTime(point.ts));
+    chart.data.datasets[0].data = state.device.points.map((point) => point.value);
     chart.update('none');
-    updateChartSummary();
+    updateDeviceSummary();
   }
 
-  function updateChartSummary() {
-    const points = state.chart.points;
-    const values = points.map((p) => Number(p.value)).filter((v) => Number.isFinite(v));
-    const sensor = state.chart.sensor || '';
+  function updateDeviceSummary() {
+    const values = state.device.points.map((p) => Number(p.value)).filter((v) => Number.isFinite(v));
+    const device = state.devices.get(state.device.id);
+    const sensor = state.device.sensor;
     if (!values.length) {
-      $('chart-current').textContent = '--';
-      $('chart-min').textContent = '--';
-      $('chart-max').textContent = '--';
-      $('chart-avg').textContent = '--';
-      $('chart-count').textContent = '0';
+      $('dm-current').textContent = '--';
+      $('dm-min').textContent = '--';
+      $('dm-max').textContent = '--';
+      $('dm-avg').textContent = '--';
+      $('dm-samples').textContent = '0';
       return;
     }
-    const last = values[values.length - 1];
-    const unit = (state.devices.get(state.chart.device)?.metrics?.[sensor] || {}).unit || '';
-    $('chart-current').textContent = `${sensor} ${fmtNumber(last)}${unit ? ` ${unit}` : ''}`;
-    $('chart-min').textContent = fmtNumber(Math.min(...values));
-    $('chart-max').textContent = fmtNumber(Math.max(...values));
-    $('chart-avg').textContent = fmtNumber(values.reduce((a, b) => a + b, 0) / values.length);
-    $('chart-count').textContent = String(values.length);
+    const unit = (device && device.metrics && device.metrics[sensor] ? device.metrics[sensor].unit : '') || '';
+    $('dm-current').textContent = `${sensor} ${fmtNumber(values[values.length - 1])}${unit ? ` ${unit}` : ''}`;
+    $('dm-min').textContent = fmtNumber(Math.min(...values));
+    $('dm-max').textContent = fmtNumber(Math.max(...values));
+    $('dm-avg').textContent = fmtNumber(values.reduce((a, b) => a + b, 0) / values.length);
+    $('dm-samples').textContent = String(values.length);
   }
 
-  function loadChartSeries() {
-    const deviceId = state.chart.device;
-    const sensor = state.chart.sensor;
-    if (!deviceId || !sensor || !state.socket) return;
-
+  function loadDeviceSeries() {
+    if (!state.device.id || !state.device.sensor || !state.socket) return;
     state.socket.emit(
       'request:history',
       {
-        device_id: deviceId,
-        sensor_name: sensor,
+        device_id: state.device.id,
+        sensor_name: state.device.sensor,
         limit: MAX_CHART_POINTS,
-        since_ms: Number($('chart-range').value) || 900000,
+        since_ms: Number($('dm-range').value) || 900000,
       },
       (response) => {
         if (!response || !response.ok) return;
-        if (response.device_id !== state.chart.device || response.sensor_name !== state.chart.sensor) return;
-        setChartSeries(response.points || []);
-        $('chart-range-label').textContent = `range ${$('chart-range').selectedOptions[0].textContent} · ${response.points.length} samples`;
+        if (response.device_id !== state.device.id || response.sensor_name !== state.device.sensor) return;
+        setDeviceSeries(response.points || []);
+        $('dm-range-label').textContent = `${$('dm-range').selectedOptions[0].textContent} · ${response.points.length} samples`;
       },
     );
   }
 
-  /* ---------------------------------------------------------------------- */
-  /* Telemetry stream                                                       */
-  /* ---------------------------------------------------------------------- */
+  /** Full device document (config, recent commands, forward history). */
+  async function loadDeviceDetail() {
+    const deviceId = state.device.id;
+    if (!deviceId) return;
+    try {
+      const response = await api(`/api/devices/${encodeURIComponent(deviceId)}`);
+      if (state.device.id !== deviceId) return;
+      const detail = response.data;
 
-  function onTelemetry(reading) {
-    const device = state.devices.get(reading.device_id);
-    if (device) {
-      device.metrics = device.metrics || {};
-      device.metrics[reading.sensor_name] = {
-        value: reading.value,
-        unit: reading.unit || null,
-        ts: reading.created_at,
-      };
-      device.last_seen = reading.created_at;
-      device.status = 'online';
-      upsertDevice(device);
-      updateCard(reading.device_id, reading.sensor_name);
-    } else {
-      scheduleGridRefresh();
+      upsertDevice({ ...detail, metrics: detail.metrics });
+      const config = detail.config || { config: {}, saved: {}, revision: 0 };
+      state.device.config = config;
+      renderConfigEditor(config);
+      renderDeviceCommands(detail.commands || []);
+      renderDeviceForward(detail.forward_logs || []);
+      renderDeviceHead();
+    } catch (error) {
+      $('dm-config-result').innerHTML = `<span class="text-[#ffb3ad]">could not load device detail: ${esc(error.message)}</span>`;
     }
-
-    // Nothing chosen yet: follow the newest stream automatically.
-    if (!state.chart.device) {
-      const newest = [...state.devices.values()]
-        .filter((d) => Object.keys(d.metrics || {}).length)
-        .sort((a, b) => (b.last_seen || 0) - (a.last_seen || 0))[0];
-      if (newest) selectDevice(newest.device_id, { sensorName: reading.sensor_name });
-      return;
-    }
-
-    if (reading.device_id !== state.chart.device) return;
-    if (reading.sensor_name !== state.chart.sensor) {
-      // A new sensor appeared for the selected device: offer it.
-      const sensors = Object.keys(state.devices.get(reading.device_id)?.metrics || {});
-      if (sensors.length) renderSensorOptions(sensors, state.chart.sensor);
-      return;
-    }
-
-    // Chart paused with the LIVE toggle: keep the series frozen.
-    if (!state.chart.live) return;
-
-    state.chart.points.push({ ts: reading.created_at, value: reading.value });
-    if (state.chart.points.length > MAX_CHART_POINTS) state.chart.points.shift();
-    chartPush({ ts: reading.created_at, value: reading.value });
   }
 
-  /* ---------------------------------------------------------------------- */
-  /* Terminal                                                               */
-  /* ---------------------------------------------------------------------- */
-
-  function terminalLine(entry) {
-    // Device-scoped focus (the "LOGS" button on a device card).
-    if (state.termDevice) {
-      const tagged = entry.meta && entry.meta.device_id === state.termDevice;
-      if (!tagged && !String(entry.message || '').includes(state.termDevice)) return;
-    }
-    if (state.focus && ['info', 'mqtt'].includes(entry.level)) return;
-    if (state.paused) {
-      state.termLines += 1;
-      $('term-count').textContent = `${state.termLines} LINES (PAUSED)`;
+  function renderDeviceForward(logs) {
+    const el = $('dm-forward');
+    if (!logs.length) {
+      el.innerHTML = state.settings?.effective?.configured
+        ? '<span class="text-[#ffcc66]">no forwarding attempts yet for this device</span>'
+        : '<span class="text-[#ffcc66]">not configured — set MAIN_WEBSITE_WEBHOOK_URL in Settings</span>';
       return;
     }
+    const last = logs[0];
+    const ok = last.status === 'success';
+    const failures = logs.filter((log) => log.status !== 'success').length;
+    el.innerHTML =
+      `<span class="${ok ? 'text-neon' : 'text-[#ffb3ad]'}">${ok ? '✓' : '✗'} ${esc(last.status)}${last.http_status ? ` (HTTP ${last.http_status})` : ''} ${esc(relTime(last.created_at))}</span>` +
+      `<span class="text-[#47605a]"> · ${logs.length} recent attempt(s), ${failures} failed</span>`;
+  }
 
-    const box = $('terminal');
-    const node = document.createElement('div');
-    node.className = `term-line term-${esc(entry.level || 'info')}`;
-    node.innerHTML = `<span class="term-time">${esc(clockTime(entry.ts || Date.now()))}</span> <span class="term-source">[${esc(
-      entry.source || 'SYS',
-    )}]</span> <span>${esc(entry.message)}</span>`;
+  /* ---- device commands --------------------------------------------------- */
 
-    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
-    box.insertBefore(node, $('term-cursor-line'));
-
-    while (box.querySelectorAll('.term-line').length > MAX_TERMINAL_LINES) {
-      box.querySelector('.term-line').remove();
+  function renderDeviceCommands(commands) {
+    const body = $('dm-commands');
+    if (!commands.length) {
+      body.innerHTML = '<tr><td colspan="3" class="px-2 py-2 text-center text-[#47605a]">no commands sent yet</td></tr>';
+      return;
     }
-    state.termLines += 1;
-    $('term-count').textContent = `${state.termLines} LINES`;
-    if (nearBottom) box.scrollTop = box.scrollHeight;
+    body.innerHTML = commands
+      .map(
+        (command) => `<tr data-command="${command.id}">
+          <td class="px-2 py-1 text-[#47605a]">${command.id}</td>
+          <td class="max-w-[14rem] truncate px-2 py-1 text-[#9fd8b4]" title="${esc(command.payload)}">${esc(String(command.payload).slice(0, 60))}</td>
+          <td class="px-2 py-1"><span class="badge px-1.5 py-0 text-[0.55rem] ${STATUS_STYLES[command.status] || ''}">${esc(command.status)}</span></td>
+        </tr>`,
+      )
+      .join('');
   }
-
-  function clearTerminal() {
-    const box = $('terminal');
-    for (const line of box.querySelectorAll('.term-line')) line.remove();
-    state.termLines = 0;
-    $('term-count').textContent = '0 LINES';
-    box.scrollTop = 0;
-  }
-
-  /* ---------------------------------------------------------------------- */
-  /* Commands                                                               */
-  /* ---------------------------------------------------------------------- */
 
   const STATUS_STYLES = {
     pending: 'text-[#eaff6b] border-[rgba(234,255,107,0.4)]',
@@ -973,117 +796,426 @@
     failed: 'text-[#ffb3ad] border-[rgba(255,59,48,0.5)]',
   };
 
-  function commandRow(command) {
-    return `<tr data-command="${command.id}">
-      <td class="py-1 pr-1 text-[#47605a]">${command.id}</td>
-      <td class="py-1 pr-1 text-[#9fd8b4]">${esc(command.device_id)}</td>
-      <td class="py-1 pr-1 max-w-[9rem] truncate text-[#6d8b84]" title="${esc(command.payload)}">${esc(
-        String(command.payload).slice(0, 48),
-      )}</td>
-      <td class="py-1"><span class="badge px-1.5 py-0 text-[0.55rem] ${STATUS_STYLES[command.status] || ''}">${esc(
-        command.status,
-      )}</span></td>
-    </tr>`;
-  }
-
-  function renderCommands(commands) {
-    state.commands = commands;
-    const body = $('commands-list');
-    $('commands-count').textContent = `${commands.length}`;
-    body.innerHTML = commands.length
-      ? commands.map(commandRow).join('')
-      : '<tr><td colspan="4" class="py-2 text-center text-[#47605a]">no commands yet</td></tr>';
-  }
-
-  function onCommandEvent(command, { prepend = false } = {}) {
-    if (!command) return;
-    const existing = state.commands.find((c) => c.id === command.id);
-    if (existing) Object.assign(existing, command);
-    else state.commands = [command, ...state.commands].slice(0, 50);
-
-    renderCommands(state.commands);
-    if (prepend) refreshStatsSoon();
-  }
-
-  let statsSoonTimer = null;
-  function refreshStatsSoon() {
-    if (statsSoonTimer) return;
-    statsSoonTimer = setTimeout(() => {
-      statsSoonTimer = null;
-      api('/api/stats')
-        .then((res) => renderStats(res.data))
-        .catch(() => {});
-    }, 1200);
-  }
-
-  async function sendCommand(deviceId, payload) {
-    return api('/api/webhook/command', {
-      method: 'POST',
-      body: JSON.stringify({ device_id: deviceId, command: payload, source: 'ui' }),
-    });
-  }
-
-  /** Card quick action — queue RELAY_ON / RELAY_OFF for one device. */
-  async function sendRelayCommand(deviceId, action, button) {
-    const original = button.textContent;
-    button.disabled = true;
-    button.textContent = '…';
+  async function sendDeviceCommand(payload, label) {
+    const deviceId = state.device.id;
+    if (!deviceId) return;
+    $('dm-result').innerHTML = '<span class="spinner inline-block align-middle"></span> sending…';
     try {
-      const response = await sendCommand(
-        deviceId,
-        JSON.stringify({ action, source: 'quick-action', issued_at: Date.now() }),
-      );
-      state.relayStates.set(deviceId, action === 'RELAY_OFF' ? 'OFF' : 'ON');
-
-      const card = state.cards.get(deviceId);
-      const device = state.devices.get(deviceId);
-      if (card && device) applyCardState(card, device);
-
-      toast(
-        `#${response.data.id} ${action} → ${deviceId}${response.published ? '' : ' (queued for device polling)'}`,
-        response.published ? 'success' : 'warn',
-      );
+      const response = await api('/api/webhook/command', {
+        method: 'POST',
+        body: JSON.stringify({ device_id: deviceId, command: payload, source: 'inspector' }),
+      });
+      const command = response.data;
+      $('dm-result').innerHTML = response.published
+        ? `<span class="text-neon">✓ ${esc(label || 'command')} published to iot/${esc(deviceId)}/command (#${command.id})</span>`
+        : `<span class="text-[#ffcc66]">⧗ #${command.id} queued — broker offline, the device will pick it up when it polls</span>`;
+      pushDeviceLog({
+        level: 'command',
+        source: 'UI',
+        message: `⇒ ${label || 'command'} sent (#${command.id}) :: ${command.payload}`,
+        ts: Date.now(),
+      });
+      if (state.commands.length) state.commands = [command, ...state.commands].slice(0, 50);
+      refreshDeviceCommands();
     } catch (error) {
-      toast(`${action} failed: ${error.message}`, 'error');
+      $('dm-result').innerHTML = `<span class="text-[#ffb3ad]">✗ ${esc(error.message)}</span>`;
+      toast(`Command failed: ${error.message}`, 'error');
+    }
+  }
+
+  async function refreshDeviceCommands() {
+    if (!state.device.id) return;
+    try {
+      const response = await api(`/api/commands?device_id=${encodeURIComponent(state.device.id)}&limit=20`);
+      if (state.device.id) renderDeviceCommands(response.data || []);
+    } catch {
+      /* non-fatal */
+    }
+  }
+
+  /* ---- custom configuration editor -------------------------------------- */
+
+  /**
+   * Paint the config editor from a server document.
+   *
+   * Background refreshes (forward_log events re-fetch the device detail) must
+   * never clobber unsaved edits, so an incoming revision is only applied when
+   * the editor is clean — unless the caller forces it (e.g. right after a save).
+   */
+  function renderConfigEditor(configDoc, options = {}) {
+    const deviceId = state.device.id;
+    if (!deviceId) return;
+    if (state.device.configDirty && !options.force) {
+      $('dm-config-status').innerHTML =
+        '<span class="text-[#ffcc66]">draft in progress — newer revision not loaded</span>';
+      return;
+    }
+    const merged = configDoc && configDoc.config ? configDoc.config : {};
+    state.device.configDraft = { ...merged };
+    state.device.configDirty = false;
+    $('dm-config-json').value = JSON.stringify(merged, null, 2);
+    $('dm-config-error').textContent = '';
+    renderConfigForm(merged);
+    $('dm-config-status').innerHTML =
+      configDoc && configDoc.updated_at ? '' : '';
+    $('dm-config-status').textContent = configDoc && configDoc.has_custom
+      ? `saved · revision ${configDoc.revision} · ${relTime(configDoc.updated_at)}`
+      : 'defaults only — not saved yet';
+    $('dm-config-status').className = `badge ml-auto ${configDoc && configDoc.has_custom ? 'border-[rgba(57,255,20,0.45)] text-neon' : 'text-[#8fb39b]'}`;
+    // `dm-config-result` deliberately survives repaints: background refreshes
+    // fire within milliseconds of a save and must not wipe the confirmation.
+    $('dm-config-rev').textContent = configDoc && configDoc.revision ? `rev ${configDoc.revision}` : 'none';
+    if (deviceId) {
+      const device = state.devices.get(deviceId);
+      if (device && configDoc) {
+        device.config = configDoc.saved || {};
+        device.config_revision = configDoc.revision || 0;
+        device.config_updated_at = configDoc.updated_at || null;
+        updateCard(deviceId, { flash: false });
+      }
+    }
+  }
+
+  function configInputType(value) {
+    if (typeof value === 'number') return 'number';
+    if (typeof value === 'boolean') return 'checkbox';
+    return 'text';
+  }
+
+  function renderConfigForm(config) {
+    const container = $('dm-config-form');
+    const entries = Object.entries(config || {});
+    container.innerHTML = entries
+      .map(([key, value]) => {
+        const type = configInputType(value);
+        if (type === 'checkbox') {
+          return `<div class="cfg-row" data-key="${esc(key)}">
+            <input class="cfg-key" value="${esc(key)}" spellcheck="false" />
+            <label class="flex items-center gap-2 text-[0.68rem] text-[#9fd8b4]">
+              <input type="checkbox" class="cfg-val accent-[#39FF14]" data-type="boolean" ${value ? 'checked' : ''} />
+              <span>${value ? 'true' : 'false'}</span>
+            </label>
+            <button class="cfg-del" data-cfg-del type="button" title="Remove">✕</button>
+          </div>`;
+        }
+        return `<div class="cfg-row" data-key="${esc(key)}">
+          <input class="cfg-key" value="${esc(key)}" spellcheck="false" />
+          <input class="cfg-val" type="${type === 'number' ? 'number' : 'text'}" step="any"
+                 data-type="${type}" value="${esc(type === 'number' ? value : String(value))}" spellcheck="false" />
+          <button class="cfg-del" data-cfg-del type="button" title="Remove">✕</button>
+        </div>`;
+      })
+      .join('') || '<p class="text-[0.66rem] text-[#47605a]">no fields — use + ADD FIELD or edit the raw JSON.</p>';
+  }
+
+  /** Form rows are the source of truth when they change. */
+  function configFromForm() {
+    const out = {};
+    for (const row of $('dm-config-form').querySelectorAll('.cfg-row')) {
+      const key = row.querySelector('.cfg-key').value.trim();
+      if (!key) continue;
+      const field = row.querySelector('.cfg-val');
+      const type = field.dataset.type;
+      let value;
+      if (type === 'boolean') value = field.checked;
+      else if (type === 'number') value = Number(field.value);
+      else if (field.value === 'true' || field.value === 'false') value = field.value === 'true';
+      else value = field.value;
+      out[key] = value;
+    }
+    return out;
+  }
+
+  function syncJsonFromForm() {
+    const config = configFromForm();
+    state.device.configDraft = config;
+    $('dm-config-json').value = JSON.stringify(config, null, 2);
+    $('dm-config-error').innerHTML = '<span class="text-neon">✓ form → JSON</span>';
+  }
+
+  function syncFormFromJson() {
+    const text = $('dm-config-json').value.trim();
+    if (!text) return;
+    try {
+      const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('config must be a JSON object');
+      state.device.configDraft = parsed;
+      renderConfigForm(parsed);
+      $('dm-config-error').innerHTML = '<span class="text-neon">✓ valid JSON</span>';
+    } catch (error) {
+      $('dm-config-error').innerHTML = `<span class="text-[#ffb3ad]">✗ ${esc(error.message)}</span>`;
+    }
+  }
+
+  async function saveDeviceConfig() {
+    const deviceId = state.device.id;
+    if (!deviceId) return;
+
+    let config;
+    const text = $('dm-config-json').value.trim();
+    try {
+      config = JSON.parse(text);
+      if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('config must be a JSON object');
+    } catch (error) {
+      $('dm-config-result').innerHTML = `<span class="text-[#ffb3ad]">✗ ${esc(error.message)}</span>`;
+      return;
+    }
+    if (!Object.keys(config).length) {
+      $('dm-config-result').innerHTML = '<span class="text-[#ffb3ad]">✗ config is empty</span>';
+      return;
+    }
+
+    const button = $('dm-config-save');
+    button.disabled = true;
+    $('dm-config-result').innerHTML = '<span class="spinner inline-block align-middle"></span> saving…';
+
+    try {
+      const response = await api(`/api/device/${encodeURIComponent(deviceId)}/config`, {
+        method: 'POST',
+        body: JSON.stringify({ config, sync: $('dm-config-notify').checked, updated_by: 'dashboard' }),
+      });
+      const saved = response.data;
+      renderConfigEditor(saved, { force: true });
+      $('dm-config-result').innerHTML =
+        `<span class="text-neon">✓ saved revision ${saved.revision} to SQLite</span>` +
+        (response.command
+          ? `<span class="text-[#9fd8b4]"> · CONFIG_SYNC queued as command #${response.command.id}</span>`
+          : '<span class="text-[#47605a]"> · device not notified</span>');
+      pushDeviceLog({
+        level: 'success',
+        source: 'CFG',
+        message: `config revision ${saved.revision} saved${response.command ? ` · CONFIG_SYNC #${response.command.id}` : ''}`,
+        ts: Date.now(),
+      });
+      toast(`Config saved for ${deviceId} (rev ${saved.revision})`, 'success');
+    } catch (error) {
+      $('dm-config-result').innerHTML = `<span class="text-[#ffb3ad]">✗ ${esc(error.message)}</span>`;
+      toast(`Config save failed: ${error.message}`, 'error');
     } finally {
       button.disabled = false;
-      button.textContent = original;
     }
   }
 
-  /** Card "LOGS" action — scope the terminal to a single device. */
-  function setTerminalDeviceFilter(deviceId) {
-    state.termDevice = deviceId || null;
-    const chip = $('term-device-filter');
-    if (!chip) return;
-    chip.classList.toggle('hidden', !state.termDevice);
-    $('term-device-filter-label').textContent = state.termDevice || '';
-    if (state.termDevice && $('terminal-section')) {
-      $('terminal-section').scrollIntoView({ behavior: 'smooth', block: 'end' });
-      toast(`Terminal filtered to ${state.termDevice}`, 'info', 2400);
+  /* ---- per-device terminal --------------------------------------------- */
+
+  function pushDeviceLog(entry) {
+    const box = $('dm-terminal');
+    if (!box) return;
+    if (state.device.logPaused) {
+      sayDeviceLog(`… ${entry.source || 'SYS'} line suppressed (paused)`);
+      return;
     }
+
+    const node = document.createElement('div');
+    node.className = `term-line term-${entry.level || 'info'}`;
+    node.innerHTML = `<span class="term-time">${esc(clockTime(entry.ts || Date.now()))}</span> <span class="term-source">[${esc(
+      entry.source || 'SYS',
+    )}]</span> <span>${esc(entry.message)}</span>`;
+
+    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+    box.insertBefore(node, $('dm-cursor-line'));
+    while (box.querySelectorAll('.term-line').length > MAX_DEVICE_LOG_LINES) box.querySelector('.term-line').remove();
+    state.device.logLines.push(entry);
+    $('dm-log-count').textContent = `${state.device.logLines.length} LINES`;
+    if (nearBottom) box.scrollTop = box.scrollHeight;
   }
 
-  /** Publishes the top-bar height so the sticky grid filter bar sits below it. */
-  function syncHeaderHeight() {
-    const header = document.querySelector('header');
-    if (!header) return;
-    const apply = () =>
-      document.documentElement.style.setProperty('--header-h', `${Math.round(header.getBoundingClientRect().height)}px`);
-    apply();
-    if (typeof ResizeObserver !== 'undefined' && !syncHeaderHeight.observer) {
-      syncHeaderHeight.observer = new ResizeObserver(apply);
-      syncHeaderHeight.observer.observe(header);
+  function sayDeviceLog(message) {
+    const box = $('dm-terminal');
+    if (!box) return;
+    const node = document.createElement('div');
+    node.className = 'term-line term-info';
+    node.innerHTML = `<span class="term-time">${esc(clockTime(Date.now()))}</span> <span>${esc(message)}</span>`;
+    box.insertBefore(node, $('dm-cursor-line'));
+  }
+
+  function clearDeviceLog() {
+    $('dm-terminal').querySelectorAll('.term-line').forEach((line) => line.remove());
+    state.device.logLines = [];
+    $('dm-log-count').textContent = '0 LINES';
+  }
+
+  /** Seed the device console with what the server already knows. */
+  async function backfillDeviceLog(deviceId) {
+    try {
+      const [telemetry, commands] = await Promise.all([
+        api('/api/telemetry/recent?limit=400'),
+        api(`/api/commands?device_id=${encodeURIComponent(deviceId)}&limit=15`),
+      ]);
+      if (state.device.id !== deviceId) return;
+
+      const rows = (telemetry.data || []).filter((row) => row.device_id === deviceId).slice(0, 60).reverse();
+      for (const row of rows) {
+        pushDeviceLog({
+          level: 'info',
+          source: 'HOOK',
+          message: `⇐ ${row.device_id} · ${row.sensor_name}=${row.value}${row.unit ? ` ${row.unit}` : ''}`,
+          ts: row.created_at,
+        });
+      }
+      for (const command of (commands.data || []).slice().reverse()) {
+        pushDeviceLog({
+          level: 'command',
+          source: 'CMD',
+          message: `⇒ #${command.id} ${command.status} (${command.source}) :: ${String(command.payload).slice(0, 90)}`,
+          ts: command.created_at,
+        });
+      }
+      sayDeviceLog(`— live stream attached to ${deviceId} —`);
+      $('dm-terminal').scrollTop = $('dm-terminal').scrollHeight;
+    } catch {
+      sayDeviceLog('— could not load history, streaming live only —');
     }
   }
 
   /* ---------------------------------------------------------------------- */
-  /* Automation                                                             */
+  /* SETTINGS MODAL                                                         */
   /* ---------------------------------------------------------------------- */
+
+  function openSettings(tab = 'forwarding') {
+    showSettingsTab(tab);
+    refreshSettings();
+    openModal('settings-modal');
+  }
+
+  function showSettingsTab(name) {
+    document.querySelectorAll('[data-set-tab]').forEach((tab) => tab.classList.toggle('is-active', tab.dataset.setTab === name));
+    document.querySelectorAll('[data-set-panel]').forEach((panel) => panel.classList.toggle('hidden', panel.dataset.setPanel !== name));
+    if (name === 'syslog') {
+      const box = $('terminal');
+      box.scrollTop = box.scrollHeight;
+    }
+  }
+
+  /* ---- upstream forwarding ---------------------------------------------- */
+
+  function renderForwardStatus(runtime, stats) {
+    if (!runtime) return;
+    state.forwardStats = stats || state.forwardStats;
+
+    const cards = [
+      { label: 'Effective URL', value: runtime.url || 'not set', small: true },
+      { label: 'Source', value: runtime.source || 'unset' },
+      { label: 'Queue', value: `${runtime.queue} / ${runtime.max_queue}` },
+      { label: 'Delivered', value: stats ? stats.success : runtime.delivered },
+      { label: 'Failed', value: stats ? stats.failed : runtime.failed },
+      { label: 'Dropped', value: runtime.dropped },
+      { label: 'Avg latency', value: stats && stats.avg_duration_ms !== null ? `${stats.avg_duration_ms} ms` : '—' },
+      { label: 'Last success', value: stats && stats.last_success_at ? relTime(stats.last_success_at) : '—' },
+    ];
+
+    $('fwd-stats').innerHTML = cards
+      .map(
+        (card) => `<div class="stat-card">
+          <p class="label mb-0">${esc(card.label)}</p>
+          <p class="${card.small ? 'truncate text-[0.72rem]' : 'text-lg'} font-bold ${
+            card.label === 'Failed' && Number(card.value) > 0 ? 'text-[#ffb3ad]' : 'text-neon'
+          }" title="${esc(String(card.value))}">${esc(String(card.value))}</p>
+        </div>`,
+      )
+      .join('');
+  }
+
+  function renderForwardLogs(logs) {
+    state.forwardLogs = logs || [];
+    const body = $('fwd-logs');
+    if (!state.forwardLogs.length) {
+      body.innerHTML = '<tr><td colspan="6" class="px-2 py-2 text-center text-[#47605a]">no delivery attempts recorded yet</td></tr>';
+      return;
+    }
+    body.innerHTML = state.forwardLogs
+      .map(
+        (log) => `<tr class="border-t border-edge">
+          <td class="px-2 py-1 text-[#47605a]">${esc(clockTime(log.created_at))}</td>
+          <td class="px-2 py-1 text-[#9fd8b4]"><button type="button" class="hover:text-neon" data-open-device="${esc(log.device_id || '')}">${esc(
+            log.device_id || '—',
+          )}</button></td>
+          <td class="px-2 py-1"><span class="badge px-1.5 py-0 text-[0.55rem] ${
+            log.status === 'success' ? 'text-neon border-[rgba(57,255,20,0.45)]' : 'text-[#ffb3ad] border-[rgba(255,59,48,0.5)]'
+          }">${esc(log.status)}</span></td>
+          <td class="px-2 py-1 text-[#6d8b84]">${log.http_status ?? '—'}</td>
+          <td class="px-2 py-1 text-[#6d8b84]">${log.duration_ms ?? '—'}</td>
+          <td class="max-w-[16rem] truncate px-2 py-1 text-[#ffb3ad]" title="${esc(log.error || '')}">${esc(log.error || '')}</td>
+        </tr>`,
+      )
+      .join('');
+  }
+
+  async function refreshSettings() {
+    try {
+      const [settings, logs] = await Promise.all([api('/api/settings'), api('/api/forward-logs?limit=25')]);
+      state.settings = settings.data;
+
+      const { effective, settings: stored, runtime } = settings.data;
+      $('fwd-url').value = stored.MAIN_WEBSITE_WEBHOOK_URL || '';
+      $('fwd-enabled').setAttribute('aria-checked', String(effective.enabled));
+
+      const envNote = settings.data.env.url && !stored.MAIN_WEBSITE_WEBHOOK_URL
+        ? ` (using .env value)`
+        : '';
+      $('fwd-result').innerHTML = effective.configured
+        ? `<span class="${effective.active ? 'text-neon' : 'text-[#ffcc66]'}">${
+            effective.active ? '✓ forwarding active' : '⚠ configured but disabled'
+          }</span><span class="text-[#47605a]"> · source: ${esc(effective.source)}${esc(envNote)}</span>`
+        : '<span class="text-[#ffcc66]">no upstream URL configured — telemetry stays local</span>';
+
+      renderForwardStatus(runtime, settings.data.stats_24h);
+      renderForwardLogs(logs.data || []);
+    } catch (error) {
+      $('fwd-result').innerHTML = `<span class="text-[#ffb3ad]">✗ could not load settings: ${esc(error.message)}</span>`;
+    }
+  }
+
+  async function saveForwardSettings({ clear = false } = {}) {
+    const url = $('fwd-url').value.trim();
+    const enabled = $('fwd-enabled').getAttribute('aria-checked') === 'true';
+    const button = $('fwd-save');
+
+    button.disabled = true;
+    try {
+      if (clear) {
+        await api('/api/settings/MAIN_WEBSITE_WEBHOOK_URL', { method: 'DELETE' });
+        toast('Stored URL cleared — falling back to .env', 'warn');
+      }
+      await api('/api/settings', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          MAIN_WEBSITE_WEBHOOK_URL: url,
+          MAIN_WEBSITE_FORWARD_ENABLED: enabled,
+        }),
+      });
+      if (!clear) toast(enabled ? 'Forwarding enabled' : 'Forwarding disabled', enabled ? 'success' : 'warn');
+      await refreshSettings();
+    } catch (error) {
+      $('fwd-result').innerHTML = `<span class="text-[#ffb3ad]">✗ ${esc(error.message)}</span>`;
+      toast(`Could not save forwarding settings: ${error.message}`, 'error');
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function testForwarding() {
+    const button = $('fwd-test');
+    button.disabled = true;
+    $('fwd-result').innerHTML = '<span class="spinner inline-block align-middle"></span> sending test document…';
+    try {
+      const result = await api('/api/forward/test', { method: 'POST', body: JSON.stringify({}) });
+      $('fwd-result').innerHTML = `<span class="text-neon">✓ test delivered to ${esc(result.url)} (HTTP ${result.http_status}, ${result.duration_ms}ms)</span>`;
+      toast('Test document delivered upstream', 'success');
+      await refreshSettings();
+    } catch (error) {
+      $('fwd-result').innerHTML = `<span class="text-[#ffb3ad]">✗ test failed: ${esc(error.message)}</span>`;
+      toast(`Forwarding test failed: ${error.message}`, 'error');
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  /* ---- automation rules -------------------------------------------------- */
 
   function renderRules(rules) {
     state.rules = rules || [];
-    const enabled = state.rules.filter((r) => r.enabled).length;
+    const enabled = state.rules.filter((rule) => rule.enabled).length;
     $('rules-count').textContent = `${enabled}/${state.rules.length} RULES`;
 
     const list = $('rules-list');
@@ -1091,11 +1223,9 @@
       list.innerHTML = '<p class="text-[0.68rem] text-[#47605a]">No rules yet — add one below.</p>';
       return;
     }
-
     list.innerHTML = state.rules
       .map(
-        (rule) => `
-      <div class="rule-row ${rule.enabled ? '' : 'is-disabled'} p-2.5" data-rule="${rule.id}">
+        (rule) => `<div class="rule-row ${rule.enabled ? '' : 'is-disabled'} p-2.5" data-rule="${rule.id}">
         <div class="flex items-start gap-2">
           <button class="switch mt-0.5" role="switch" aria-checked="${rule.enabled ? 'true' : 'false'}"
                   data-rule-toggle="${rule.id}" aria-label="Toggle rule ${esc(rule.name)}"></button>
@@ -1126,7 +1256,7 @@
       return;
     }
     list.innerHTML = state.ruleEvents
-      .slice(0, 10)
+      .slice(0, 12)
       .map(
         (event) => `<li class="truncate" title="${esc(event.rule_name)} on ${esc(event.device_id)}">
           <span class="text-[#47605a]">${esc(clockTime(event.created_at))}</span>
@@ -1138,12 +1268,146 @@
       .join('');
   }
 
+  /* ---- command queue ----------------------------------------------------- */
+
+  function commandRow(command) {
+    return `<tr data-command="${command.id}" class="border-t border-edge">
+      <td class="px-2 py-1 text-[#47605a]">${command.id}</td>
+      <td class="px-2 py-1 text-[#9fd8b4]"><button type="button" class="hover:text-neon" data-open-device="${esc(
+        command.device_id,
+      )}">${esc(command.device_id)}</button></td>
+      <td class="max-w-[16rem] truncate px-2 py-1 text-[#6d8b84]" title="${esc(command.payload)}">${esc(String(command.payload).slice(0, 72))}</td>
+      <td class="px-2 py-1 text-[#7dd3fc]">${esc(command.source)}</td>
+      <td class="px-2 py-1"><span class="badge px-1.5 py-0 text-[0.55rem] ${STATUS_STYLES[command.status] || ''}">${esc(
+        command.status,
+      )}</span></td>
+    </tr>`;
+  }
+
+  function renderCommands(commands) {
+    state.commands = commands || [];
+    $('commands-count').textContent = `${state.commands.length}`;
+    $('commands-list').innerHTML = state.commands.length
+      ? state.commands.map(commandRow).join('')
+      : '<tr><td colspan="5" class="px-2 py-2 text-center text-[#47605a]">no commands yet</td></tr>';
+  }
+
+  function onCommandEvent(command, { prepend = false } = {}) {
+    if (!command) return;
+    const existing = state.commands.find((c) => c.id === command.id);
+    if (existing) Object.assign(existing, command);
+    else if (prepend) state.commands = [command, ...state.commands].slice(0, 50);
+
+    renderCommands(state.commands);
+    if (state.device.id && state.device.id === command.device_id) refreshDeviceCommands();
+  }
+
+  /* ---- system log -------------------------------------------------------- */
+
+  /**
+   * Mirror a system-log line into the open device inspector.
+   *
+   * Telemetry ingest lines are skipped on purpose: the server throttles the
+   * global stream to 25 lines/s, so a busy fleet would starve the inspector.
+   * Those lines are written directly from `onTelemetry` instead — see below.
+   *
+   * Mirrored before the terminal's own focus/pause filters so that narrowing
+   * the system log never silently stops the per-device console.
+   */
+  function mirrorToDeviceLog(entry) {
+    const deviceId = state.device.id;
+    if (!deviceId) return;
+    const meta = entry.meta || {};
+    if (meta.sensor_name) return; // telemetry — handled by onTelemetry
+    if (meta.device_id === deviceId) {
+      pushDeviceLog(entry);
+      return;
+    }
+    const mentioned = String(entry.message || '').includes(deviceId);
+    if (mentioned && ['HOOK', 'MQTT', 'UI', 'CMD'].includes(entry.source)) pushDeviceLog(entry);
+  }
+
+  function terminalLine(entry) {
+    mirrorToDeviceLog(entry);
+
+    if (state.termFocus && ['info', 'mqtt'].includes(entry.level)) return;
+
+    if (state.termPaused) {
+      state.termLines += 1;
+      $('term-count').textContent = `${state.termLines} LINES (PAUSED)`;
+      return;
+    }
+
+    const box = $('terminal');
+    const node = document.createElement('div');
+    node.className = `term-line term-${esc(entry.level || 'info')}`;
+    node.innerHTML = `<span class="term-time">${esc(clockTime(entry.ts || Date.now()))}</span> <span class="term-source">[${esc(
+      entry.source || 'SYS',
+    )}]</span> <span>${esc(entry.message)}</span>`;
+
+    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+    box.insertBefore(node, $('term-cursor-line'));
+    while (box.querySelectorAll('.term-line').length > MAX_TERMINAL_LINES) box.querySelector('.term-line').remove();
+    state.termLines += 1;
+    $('term-count').textContent = `${state.termLines} LINES`;
+    if (nearBottom) box.scrollTop = box.scrollHeight;
+  }
+
+  function clearTerminal() {
+    $('terminal').querySelectorAll('.term-line').forEach((line) => line.remove());
+    state.termLines = 0;
+    $('term-count').textContent = '0 LINES';
+  }
+
   /* ---------------------------------------------------------------------- */
-  /* Wiring                                                                 */
+  /* Socket wiring                                                          */
   /* ---------------------------------------------------------------------- */
 
-  function bindEvents() {
-    // ---- socket
+  function onTelemetry(reading) {
+    const device = state.devices.get(reading.device_id);
+    if (device) {
+      device.metrics = device.metrics || {};
+      device.metrics[reading.sensor_name] = { value: reading.value, unit: reading.unit || null, ts: reading.created_at };
+      device.last_seen = reading.created_at;
+      device.status = 'online';
+      upsertDevice(device);
+      updateCard(reading.device_id);
+    } else {
+      scheduleGridRefresh();
+    }
+
+    // Live chart + readouts + console for the open inspector. The device log is
+    // written here rather than from the throttled system log so the stream is
+    // always complete for the selected device.
+    const d = state.device;
+    if (d.id === reading.device_id) {
+      const value = reading.value === null || reading.value === undefined ? reading.raw_value : reading.value;
+      pushDeviceLog({
+        level: 'info',
+        source: reading.source === 'mqtt' ? 'MQTT' : 'HOOK',
+        message: `⇐ ${reading.device_id} · ${reading.sensor_name}=${value}${reading.unit ? ` ${reading.unit}` : ''}`,
+        ts: reading.created_at || Date.now(),
+      });
+      renderDeviceHead();
+      if (d.sensor && reading.sensor_name === d.sensor && d.live) {
+        d.points.push({ ts: reading.created_at, value: reading.value });
+        if (d.points.length > MAX_CHART_POINTS) d.points.shift();
+        const chart = d.chart;
+        if (chart) {
+          chart.data.labels.push(clockTime(reading.created_at));
+          chart.data.datasets[0].data.push(reading.value);
+          if (chart.data.labels.length > MAX_CHART_POINTS) {
+            chart.data.labels.splice(0, chart.data.labels.length - MAX_CHART_POINTS);
+            chart.data.datasets[0].data.splice(0, chart.data.datasets[0].data.length - MAX_CHART_POINTS);
+          }
+          chart.update('none');
+        }
+        updateDeviceSummary();
+      }
+    }
+  }
+
+  function bindSocket() {
     const socket = (state.socket = io({ transports: ['websocket', 'polling'] }));
 
     socket.on('connect', () => setConnected(true));
@@ -1159,34 +1423,24 @@
       renderCommands(payload.commands || []);
       renderStats(payload.stats);
       renderMqtt(payload.mqtt);
+      state.settings = state.settings || {};
+      renderForwardStatus(payload.forward, payload.forward_stats);
+      renderForwardLogs(payload.forward_logs || []);
       for (const entry of payload.terminal || []) terminalLine(entry);
-
-      if (state.chart.live && !state.selected) {
-        const candidate = [...state.devices.values()]
-          .filter((d) => d.status === 'online' && Object.keys(d.metrics || {}).length)
-          .sort((a, b) => (b.last_seen || 0) - (a.last_seen || 0))[0];
-        if (candidate) selectDevice(candidate.device_id);
-        else {
-          const anyDevice = [...state.devices.values()][0];
-          if (anyDevice) {
-            state.chart.device = anyDevice.device_id;
-            $('chart-device').value = anyDevice.device_id;
-            renderSensorOptions(Object.keys(anyDevice.metrics || {}));
-          }
-        }
-      }
-      toast(`Dashboard synced · ${payload.total_devices} devices`, 'success', 2600);
+      toast(`Synced · ${payload.total_devices} devices`, 'success', 2400);
     });
 
     socket.on('telemetry_update', onTelemetry);
+
     const onDeviceEvent = (device) => {
       upsertDevice(device);
-      updateCard(device.device_id, null, { flash: false });
-      // Device may need to appear/disappear/reorder in the grid.
+      updateCard(device.device_id, { flash: false });
       scheduleGridRefresh();
+      if (state.device.id === device.device_id) renderDeviceHead();
     };
-    socket.on('device_status', onDeviceEvent); // documented device-grid event
-    socket.on('device_update', onDeviceEvent); // backwards-compatible alias
+    socket.on('device_status', onDeviceEvent);
+    socket.on('device_update', onDeviceEvent);
+
     socket.on('command_sent', (command) => onCommandEvent(command, { prepend: true }));
     socket.on('command_delivered', (command) => onCommandEvent(command));
     socket.on('command_acked', (command) => onCommandEvent(command));
@@ -1194,20 +1448,40 @@
     socket.on('mqtt_status', renderMqtt);
     socket.on('terminal', terminalLine);
     socket.on('rules_changed', renderRules);
-    socket.on('rule_triggered', ({ rule, reading, command }) => {
-      toast(`RULE #${rule.id} fired on ${reading.device_id}: ${rule.action}`, 'warn', 6000);
-      prependRuleEvent(rule, reading);
-      renderRules(
-        state.rules.map((r) => (String(r.id) === String(rule.id) ? { ...r, trigger_count: (r.trigger_count || 0) + 1, last_triggered: Date.now() } : r)),
-      );
-      if (command) onCommandEvent(command, { prepend: true });
+
+    socket.on('device_config', (config) => {
+      const device = state.devices.get(config.device_id);
+      if (device) {
+        device.config = config.saved || {};
+        device.config_revision = config.revision || 0;
+        device.config_updated_at = config.updated_at || null;
+        updateCard(config.device_id, { flash: false });
+      }
+      if (state.device.id === config.device_id) renderConfigEditor(config);
+      // (renderConfigEditor itself refuses to clobber an unsaved draft)
     });
 
-    function prependRuleEvent(rule, reading) {
+    socket.on('forward_log', (entry) => {
+      state.forwardLogs = [entry, ...state.forwardLogs].slice(0, 50);
+      renderForwardLogs(state.forwardLogs);
+      if (state.device.id && entry.device_id === state.device.id) {
+        pushDeviceLog({
+          level: entry.status === 'success' ? 'success' : 'error',
+          source: 'FWD',
+          message: `⇑ upstream ${entry.status}${entry.http_status ? ` (HTTP ${entry.http_status})` : ''}${
+            entry.error ? ` — ${entry.error}` : ''
+          }`,
+          ts: entry.created_at || Date.now(),
+        });
+        loadDeviceDetail();
+      }
+    });
+
+    socket.on('rule_triggered', ({ rule, reading, command }) => {
+      toast(`RULE #${rule.id} fired on ${reading.device_id}: ${rule.action}`, 'warn', 6000);
       renderRuleEvents([
         {
           id: Date.now(),
-          rule_id: rule.id,
           rule_name: rule.name,
           device_id: reading.device_id,
           sensor_name: reading.sensor_name,
@@ -1219,27 +1493,35 @@
         },
         ...state.ruleEvents,
       ]);
-    }
+      renderRules(
+        state.rules.map((r) =>
+          String(r.id) === String(rule.id) ? { ...r, trigger_count: (r.trigger_count || 0) + 1, last_triggered: Date.now() } : r,
+        ),
+      );
+      if (command) onCommandEvent(command, { prepend: true });
+    });
 
+    socket.on('settings_changed', () => refreshSettings());
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Event wiring                                                           */
+  /* ---------------------------------------------------------------------- */
+
+  function bindEvents() {
     // ---- device grid
-    // Select a card, or run one of its quick actions.
-    $('device-grid').addEventListener('click', async (event) => {
+    $('device-grid').addEventListener('click', (event) => {
       const card = event.target.closest('.device-card');
       if (!card) return;
-      const deviceId = card.dataset.device;
+      openDevice(card.dataset.device);
+    });
 
-      const relayButton = event.target.closest('[data-relay]');
-      if (relayButton) {
-        await sendRelayCommand(deviceId, relayButton.dataset.relay, relayButton);
-        return;
-      }
-
-      if (event.target.closest('[data-logs]')) {
-        setTerminalDeviceFilter(deviceId);
-        return;
-      }
-
-      selectDevice(deviceId);
+    $('device-grid').addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      const card = event.target.closest('.device-card');
+      if (!card) return;
+      event.preventDefault();
+      openDevice(card.dataset.device);
     });
 
     $('device-more').addEventListener('click', () => {
@@ -1272,98 +1554,148 @@
       });
     }
 
-    // ---- chart controls
-    $('chart-device').addEventListener('change', (event) => selectDevice(event.target.value));
-    $('chart-sensor').addEventListener('change', (event) => {
-      state.chart.sensor = event.target.value;
-      loadChartSeries();
-    });
-    $('chart-range').addEventListener('change', loadChartSeries);
-    $('chart-live').addEventListener('click', () => {
-      state.chart.live = !state.chart.live;
-      $('chart-live').classList.toggle('btn-active', state.chart.live);
-      $('chart-live').textContent = state.chart.live ? '● LIVE' : '○ PAUSED';
-      if (state.chart.live) loadChartSeries(); // catch up on the frozen window
-      toast(state.chart.live ? 'Live stream resumed' : 'Chart paused (history kept)', 'info', 2400);
+    // Open a device from a click inside either modal (forward log / queue rows).
+    document.addEventListener('click', (event) => {
+      const trigger = event.target.closest('[data-open-device]');
+      if (!trigger) return;
+      const deviceId = trigger.dataset.openDevice;
+      if (!deviceId) return;
+      closeModal('settings-modal');
+      openDevice(deviceId);
     });
 
-    // ---- command form
-    $('cmd-use-selected').addEventListener('click', () => {
-      if (!state.selected) return toast('No device selected — click a device card first', 'warn');
-      $('cmd-device').value = state.selected;
+    // ---- device modal
+    $('dm-close').addEventListener('click', closeDevice);
+    document.querySelectorAll('[data-modal-close]').forEach((el) => el.addEventListener('click', closeDevice));
+    document.querySelectorAll('[data-modal-tab]').forEach((tab) =>
+      tab.addEventListener('click', () => showDeviceTab(tab.dataset.modalTab)),
+    );
+
+    $('dm-sensor').addEventListener('change', (event) => {
+      state.device.sensor = event.target.value;
+      loadDeviceSeries();
+    });
+    $('dm-range').addEventListener('change', loadDeviceSeries);
+    $('dm-live').addEventListener('click', () => {
+      state.device.live = !state.device.live;
+      $('dm-live').classList.toggle('btn-active', state.device.live);
+      $('dm-live').textContent = state.device.live ? '● LIVE' : '○ PAUSED';
     });
 
-    for (const button of document.querySelectorAll('[data-cmd-mode]')) {
+    for (const button of document.querySelectorAll('[data-dm-quick]')) {
       button.addEventListener('click', () => {
-        state.cmdMode = button.dataset.cmdMode;
-        for (const other of document.querySelectorAll('[data-cmd-mode]')) {
-          other.classList.toggle('btn-active', other === button);
+        const action = button.dataset.dmQuick;
+        if (action === 'CONFIG_SYNC') {
+          sendDeviceCommand(JSON.stringify({ action, reason: 'manual-sync', issued_at: Date.now() }), 'CONFIG_SYNC');
+          return;
         }
-        $('cmd-payload-hint').textContent =
-          state.cmdMode === 'json'
-            ? 'JSON mode validates the payload and sends a compact object.'
+        const payload =
+          state.device.payloadMode === 'json' ? JSON.stringify({ action }) : action;
+        sendDeviceCommand(payload, action);
+      });
+    }
+
+    for (const button of document.querySelectorAll('[data-dm-mode]')) {
+      button.addEventListener('click', () => {
+        state.device.payloadMode = button.dataset.dmMode;
+        for (const other of document.querySelectorAll('[data-dm-mode]')) other.classList.toggle('btn-active', other === button);
+        $('dm-payload-hint').textContent =
+          state.device.payloadMode === 'json'
+            ? 'JSON payloads are validated before sending.'
             : 'Text mode sends the payload verbatim.';
       });
     }
 
-    for (const button of document.querySelectorAll('[data-quick-command]')) {
-      button.addEventListener('click', () => {
-        const cmd = button.dataset.quickCommand;
-        $('cmd-payload').value = state.cmdMode === 'json' ? JSON.stringify({ action: cmd }, null, 2) : cmd;
-      });
-    }
-
-    $('cmd-payload').addEventListener('input', () => {
-      if (state.cmdMode !== 'json') return;
-      const value = $('cmd-payload').value.trim();
+    $('dm-payload').addEventListener('input', () => {
+      if (state.device.payloadMode !== 'json') return;
+      const value = $('dm-payload').value.trim();
       if (!value) return;
       try {
         JSON.parse(value);
-        $('cmd-payload-hint').innerHTML = '<span class="text-neon">✓ valid JSON</span>';
+        $('dm-payload-hint').innerHTML = '<span class="text-neon">✓ valid JSON</span>';
       } catch (error) {
-        $('cmd-payload-hint').innerHTML = `<span class="text-[#ffb3ad]">✗ ${esc(error.message)}</span>`;
+        $('dm-payload-hint').innerHTML = `<span class="text-[#ffb3ad]">✗ ${esc(error.message)}</span>`;
       }
     });
 
-    $('command-form').addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const deviceId = $('cmd-device').value.trim();
-      const raw = $('cmd-payload').value.trim();
-      if (!deviceId) return toast('Target device id is required', 'warn');
-      if (!raw) return toast('Command payload is required', 'warn');
-
+    $('dm-send').addEventListener('click', () => {
+      const raw = $('dm-payload').value.trim();
+      if (!raw) return toast('Payload is required', 'warn');
       let payload = raw;
-      if (state.cmdMode === 'json') {
+      if (state.device.payloadMode === 'json') {
         try {
           payload = JSON.stringify(JSON.parse(raw));
         } catch (error) {
           return toast(`Invalid JSON: ${error.message}`, 'error');
         }
       }
+      return sendDeviceCommand(payload, 'custom');
+    });
 
-      const button = $('cmd-send');
-      button.disabled = true;
-      $('cmd-result').innerHTML = '<span class="spinner inline-block align-middle"></span> sending…';
-      try {
-        const response = await sendCommand(deviceId, payload);
-        const queued = response.data;
-        $('cmd-result').innerHTML = response.published
-          ? `<span class="text-neon">✓ published to iot/${esc(deviceId)}/command (cmd #${queued.id})</span>`
-          : `<span class="text-[#ffcc66]">⧗ queued #${queued.id} — MQTT broker offline, device can poll /api/webhook/command/poll</span>`;
-        onCommandEvent(queued, { prepend: true });
-      } catch (error) {
-        $('cmd-result').innerHTML = `<span class="text-[#ffb3ad]">✗ ${esc(error.message)}</span>`;
-        toast(`Command failed: ${error.message}`, 'error');
-      } finally {
-        button.disabled = false;
+    // ---- config editor
+    const markConfigDirty = () => {
+      state.device.configDirty = true;
+    };
+
+    $('dm-config-json').addEventListener('input', () => {
+      markConfigDirty();
+      clearTimeout(window._cfgTimer);
+      window._cfgTimer = setTimeout(syncFormFromJson, 220);
+    });
+
+    $('dm-config-form').addEventListener('input', () => {
+      markConfigDirty();
+      syncJsonFromForm();
+    });
+    $('dm-config-form').addEventListener('click', (event) => {
+      if (!event.target.closest('[data-cfg-del]')) return;
+      const row = event.target.closest('.cfg-row');
+      if (row) {
+        row.remove();
+        markConfigDirty();
+        syncJsonFromForm();
       }
     });
 
-    document.addEventListener('keydown', (event) => {
-      if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-        event.preventDefault();
-        $('command-form').requestSubmit();
-      }
+    $('dm-config-add').addEventListener('click', () => {
+      markConfigDirty();
+      const config = configFromForm();
+      let index = 1;
+      let key = 'new_key';
+      while (Object.prototype.hasOwnProperty.call(config, key)) key = `new_key_${index++}`;
+      config[key] = '';
+      state.device.configDraft = config;
+      $('dm-config-json').value = JSON.stringify(config, null, 2);
+      renderConfigForm(config);
+      const rows = $('dm-config-form').querySelectorAll('.cfg-row');
+      if (rows.length) rows[rows.length - 1].querySelector('.cfg-key').select();
+    });
+
+    $('dm-config-save').addEventListener('click', saveDeviceConfig);
+
+    // ---- device log controls
+    $('dm-log-clear').addEventListener('click', clearDeviceLog);
+    $('dm-log-pause').addEventListener('click', () => {
+      state.device.logPaused = !state.device.logPaused;
+      $('dm-log-pause').classList.toggle('btn-active', state.device.logPaused);
+      $('dm-log-pause').textContent = state.device.logPaused ? 'RESUME' : 'PAUSE';
+    });
+
+    // ---- settings modal
+    $('open-settings').addEventListener('click', () => openSettings('forwarding'));
+    $('open-logs').addEventListener('click', () => openSettings('syslog'));
+    $('set-close').addEventListener('click', () => closeModal('settings-modal'));
+    document.querySelectorAll('[data-settings-close]').forEach((el) => el.addEventListener('click', () => closeModal('settings-modal')));
+    document.querySelectorAll('[data-set-tab]').forEach((tab) =>
+      tab.addEventListener('click', () => showSettingsTab(tab.dataset.setTab)),
+    );
+
+    $('fwd-save').addEventListener('click', () => saveForwardSettings());
+    $('fwd-test').addEventListener('click', testForwarding);
+    $('fwd-reset').addEventListener('click', () => saveForwardSettings({ clear: true }));
+    $('fwd-enabled').addEventListener('click', () => {
+      const next = $('fwd-enabled').getAttribute('aria-checked') !== 'true';
+      $('fwd-enabled').setAttribute('aria-checked', String(next));
     });
 
     // ---- automation
@@ -1375,10 +1707,7 @@
         const next = rule ? !rule.enabled : true;
         toggle.setAttribute('aria-checked', next ? 'true' : 'false');
         try {
-          const response = await api(`/api/rules/${id}/toggle`, {
-            method: 'POST',
-            body: JSON.stringify({ enabled: next }),
-          });
+          const response = await api(`/api/rules/${id}/toggle`, { method: 'POST', body: JSON.stringify({ enabled: next }) });
           renderRules(state.rules.map((r) => (String(r.id) === String(id) ? response.data : r)));
           toast(`Rule #${id} ${response.data.enabled ? 'enabled' : 'disabled'}`, response.data.enabled ? 'success' : 'warn');
         } catch (error) {
@@ -1441,29 +1770,37 @@
       }
     });
 
-    // ---- terminal controls
+    // ---- system log controls
     $('term-clear').addEventListener('click', clearTerminal);
     $('term-pause').addEventListener('click', () => {
-      state.paused = !state.paused;
-      $('term-pause').classList.toggle('btn-active', state.paused);
-      $('term-pause').textContent = state.paused ? 'RESUME' : 'PAUSE';
-      if (!state.paused) {
+      state.termPaused = !state.termPaused;
+      $('term-pause').classList.toggle('btn-active', state.termPaused);
+      $('term-pause').textContent = state.termPaused ? 'RESUME' : 'PAUSE';
+      if (!state.termPaused) {
         $('term-count').textContent = `${state.termLines} LINES`;
         $('terminal').scrollTop = $('terminal').scrollHeight;
       }
     });
     $('term-filter-toggle').addEventListener('click', () => {
-      state.focus = !state.focus;
-      $('term-filter-toggle').classList.toggle('btn-active', state.focus);
-      toast(state.focus ? 'Terminal focus: webhooks, commands, rules only' : 'Terminal focus: everything', 'info', 2200);
+      state.termFocus = !state.termFocus;
+      $('term-filter-toggle').classList.toggle('btn-active', state.termFocus);
+      toast(state.termFocus ? 'Log focus: webhooks, commands, rules only' : 'Log focus: everything', 'info', 2200);
     });
-    $('term-device-filter-clear').addEventListener('click', () => setTerminalDeviceFilter(null));
 
-    // Keep the sticky bar aligned and re-chart cards revealed by a resize.
+    // ---- global keys
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        if (!$('device-modal').classList.contains('hidden')) closeDevice();
+        else if (!$('settings-modal').classList.contains('hidden')) closeModal('settings-modal');
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key === 'Enter' && state.device.id) {
+        event.preventDefault();
+        $('dm-send').click();
+      }
+    });
+
     window.addEventListener('resize', () => {
-      syncHeaderHeight();
-      clearTimeout(window._sparklineResizeTimer);
-      window._sparklineResizeTimer = setTimeout(createVisibleSparklines, 220);
+      if (state.device.chart) state.device.chart.resize();
     });
   }
 
@@ -1486,18 +1823,15 @@
       toast('Socket.io client failed to load', 'error', 8000);
       return;
     }
-    initChart();
-    initSparklineObserver();
-    syncHeaderHeight();
-    renderSensorOptions(['temperature']);
     renderGrid();
     startClock();
     bindEvents();
+    bindSocket();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
 
-  // Expose a tiny debug handle (handy in the browser console / handover docs).
-  window.iotDashboard = { state, api, selectDevice, toast };
+  // Small debug handle for the browser console / handover notes.
+  window.iotDashboard = { state, api, openDevice, toast, refreshSettings };
 })();

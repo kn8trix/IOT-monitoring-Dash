@@ -173,8 +173,22 @@ function ingestReading(input = {}, options = {}) {
   if (source === 'mqtt') counters.mqtt += stored;
   else counters.http += stored;
 
-  // Fan out to Socket.io + the automation engine.
-  for (const reading of accepted) bus.emit('telemetry', reading);
+  // Fan out to Socket.io + the automation engine. `source` rides along on the
+  // socket copy only (it is not a column) so the device inspector can label a
+  // line HOOK or MQTT accurately.
+  for (const reading of accepted) bus.emit('telemetry', { ...reading, source });
+
+  // Hand the whole batch to the upstream forwarder (async, fire-and-forget).
+  if (persisted.length) {
+    bus.emit('ingest:batch', {
+      device_id: deviceId,
+      source,
+      payload: input,
+      readings: persisted,
+      device,
+      received_at: Date.now(),
+    });
+  }
 
   const ok = stored + rawStored > 0;
   return {
@@ -214,11 +228,25 @@ function summarize(reading) {
   return `${reading.device_id} · ${reading.sensor_name}=${value}${suffix}`;
 }
 
+/**
+ * Log metadata for a reading. The dashboard's per-device console filters on
+ * `meta.device_id`, so every telemetry log line carries it.
+ */
+function logMeta(reading) {
+  return {
+    device_id: reading.device_id,
+    sensor_name: reading.sensor_name,
+    value: reading.value === null ? reading.raw_value : reading.value,
+    unit: reading.unit || null,
+  };
+}
+
 module.exports = {
   ingestReading,
   normalizePayload,
   shouldLogDevice,
   summarize,
+  logMeta,
   counters,
   LOG_THROTTLE_MS,
   getStatus: () => ({

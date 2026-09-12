@@ -24,6 +24,7 @@ const db = require('./db');
 const mqtt = require('./mqtt');
 const ingest = require('./ingest');
 const automation = require('./automation');
+const forwarder = require('./forwarder');
 const apiRoutes = require('./routes/api');
 const { rateLimit, requestLogger } = require('./middleware');
 const { bus, log } = require('./events');
@@ -36,6 +37,7 @@ db.init();
 db.seedDevices(config.seed.deviceCount);
 db.seedDefaultRules();
 automation.start();
+forwarder.start();
 
 /* -------------------------------------------------------------------------- */
 /* Express                                                                    */
@@ -154,7 +156,7 @@ function terminal(entry) {
 function snapshot() {
   const devices = db.listDevices({ limit: 1000, sparkline: true, sparklinePoints: 10 });
   return {
-    stats: { ...db.stats(), clients: io.engine.clientsCount },
+    stats: { ...db.stats(), clients: io.engine.clientsCount, forward: forwarder.getStatus() },
     devices: devices.devices,
     total_devices: devices.total,
     rules: db.listRules(),
@@ -163,6 +165,9 @@ function snapshot() {
     recent_telemetry: db.recentTelemetry(40),
     mqtt: mqtt.getStatus(),
     ingest: ingest.getStatus(),
+    settings: db.allSettings(),
+    forward: forwarder.getStatus(),
+    forward_logs: db.listForwardLogs({ limit: 10 }),
     terminal: terminalBacklog.slice(-80),
     server_time: Date.now(),
     version: require('../package.json').version,
@@ -234,10 +239,18 @@ bus.on('command:acked', (command) => io.emit('command_acked', command));
 bus.on('rule:triggered', (payload) => io.emit('rule_triggered', payload));
 bus.on('rules:changed', (rules) => io.emit('rules_changed', rules));
 bus.on('mqtt:status', (status) => io.emit('mqtt_status', status));
+// Device inspector: saved configs and upstream-forwarding activity.
+bus.on('config:changed', (config) => io.emit('device_config', config));
+bus.on('settings:changed', (settings) => io.emit('settings_changed', settings));
+bus.on('forward:log', (entry) => io.emit('forward_log', entry));
 
 let statsTimer = null;
 function broadcastStats() {
-  io.emit('stats', { ...db.stats(), clients: io.engine.clientsCount });
+  io.emit('stats', {
+    ...db.stats(),
+    clients: io.engine.clientsCount,
+    forward: forwarder.getStatus(),
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -294,6 +307,7 @@ async function shutdown(signal) {
   clearInterval(sweepTimer);
   clearInterval(pruneTimer);
   automation.stop();
+  forwarder.stop();
 
   io.emit('terminal', { level: 'error', source: 'SYS', message: 'server shutting down', ts: Date.now() });
 

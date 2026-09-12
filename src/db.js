@@ -14,6 +14,8 @@
  * Schema versions
  *   1  initial build
  *   2  devices.mac (shown on the dashboard device cards)
+ *   3  device_configs + forward_logs + settings (device inspector, upstream
+ *      forwarding, UI-editable system settings)
  */
 
 const fs = require('fs');
@@ -23,7 +25,22 @@ const Database = require('better-sqlite3');
 const config = require('./config');
 const { bus, log } = require('./events');
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
+
+/**
+ * Configuration an ESP/Arduino gets back from `GET /api/device/:id/config` when
+ * nothing has been saved for it yet. Devices can therefore fetch a usable
+ * config on first boot, before any operator has touched the dashboard.
+ */
+const DEFAULT_DEVICE_CONFIG = {
+  sample_rate_ms: 5000,
+  temp_threshold: 30,
+  relay_pin: 2,
+  mqtt_interval_ms: 5000,
+};
+
+/** System settings editable from the UI (they override .env values). */
+const SETTING_KEYS = ['MAIN_WEBSITE_WEBHOOK_URL', 'MAIN_WEBSITE_FORWARD_ENABLED'];
 
 let db = null;
 let stmts = {};
@@ -116,6 +133,40 @@ CREATE TABLE IF NOT EXISTS rule_events (
   created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rule_events_time ON rule_events (created_at DESC);
+
+-- Per-device custom configuration, written by the dashboard modal and read by
+-- the device itself at boot via GET /api/device/:id/config.
+CREATE TABLE IF NOT EXISTS device_configs (
+  device_id  TEXT PRIMARY KEY,
+  config     TEXT    NOT NULL,
+  updated_by TEXT,
+  revision   INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+-- Every attempt to forward telemetry to MAIN_WEBSITE_WEBHOOK_URL.
+CREATE TABLE IF NOT EXISTS forward_logs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id   TEXT,
+  url         TEXT    NOT NULL,
+  status      TEXT    NOT NULL,
+  http_status INTEGER,
+  attempt     INTEGER NOT NULL DEFAULT 1,
+  duration_ms INTEGER,
+  payload     TEXT,
+  error       TEXT,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_forward_logs_time   ON forward_logs (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_forward_logs_device ON forward_logs (device_id, created_at DESC);
+
+-- Key/value system settings (UI overrides .env).
+CREATE TABLE IF NOT EXISTS settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT,
+  updated_at INTEGER NOT NULL
+);
 `;
 
 /* -------------------------------------------------------------------------- */
@@ -179,6 +230,15 @@ function migrate() {
   if (!columns.has('mac')) {
     db.exec('ALTER TABLE devices ADD COLUMN mac TEXT');
     log('info', 'DB', 'migration applied: devices.mac (schema v2)');
+  }
+
+  // v3 tables are covered by the idempotent DDL above; log the upgrade once.
+  if (version < 3) {
+    const tables = new Set(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name),
+    );
+    const added = ['device_configs', 'forward_logs', 'settings'].filter((name) => tables.has(name));
+    log('info', 'DB', `migration applied: schema v3 (${added.join(', ')})`);
   }
 
   if (version !== SCHEMA_VERSION) {
@@ -393,6 +453,61 @@ function prepare() {
         SELECT id FROM rule_events ORDER BY id DESC LIMIT 1 OFFSET @maxRows
       )
     `),
+
+    getConfig: db.prepare(`SELECT * FROM device_configs WHERE device_id = ?`),
+    listConfigs: db.prepare(`SELECT device_id, config, revision, updated_at FROM device_configs`),
+    upsertConfig: db.prepare(`
+      INSERT INTO device_configs (device_id, config, updated_by, revision, created_at, updated_at)
+      VALUES (@device_id, @config, @updated_by, 1, @ts, @ts)
+      ON CONFLICT(device_id) DO UPDATE SET
+        config     = excluded.config,
+        updated_by = excluded.updated_by,
+        revision   = device_configs.revision + 1,
+        updated_at = excluded.updated_at
+    `),
+    deleteConfig: db.prepare(`DELETE FROM device_configs WHERE device_id = ?`),
+    countConfigs: db.prepare(`SELECT COUNT(*) AS c FROM device_configs`),
+
+    getSetting: db.prepare(`SELECT * FROM settings WHERE key = ?`),
+    listSettings: db.prepare(`SELECT key, value, updated_at FROM settings ORDER BY key ASC`),
+    upsertSetting: db.prepare(`
+      INSERT INTO settings (key, value, updated_at) VALUES (@key, @value, @ts)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `),
+    deleteSetting: db.prepare(`DELETE FROM settings WHERE key = ?`),
+
+    insertForwardLog: db.prepare(`
+      INSERT INTO forward_logs (device_id, url, status, http_status, attempt, duration_ms, payload, error, created_at)
+      VALUES (@device_id, @url, @status, @http_status, @attempt, @duration_ms, @payload, @error, @created_at)
+    `),
+    listForwardLogs: db.prepare(`
+      SELECT id, device_id, url, status, http_status, attempt, duration_ms, error, created_at
+        FROM forward_logs ORDER BY id DESC LIMIT ?
+    `),
+    listForwardLogsForDevice: db.prepare(`
+      SELECT id, device_id, url, status, http_status, attempt, duration_ms, error, created_at
+        FROM forward_logs WHERE device_id = ? ORDER BY id DESC LIMIT ?
+    `),
+    forwardStats: db.prepare(`
+      SELECT
+        COUNT(*)                                                   AS total,
+        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END)        AS success,
+        SUM(CASE WHEN status = 'failed'  THEN 1 ELSE 0 END)        AS failed,
+        SUM(CASE WHEN status = 'dropped' THEN 1 ELSE 0 END)        AS dropped,
+        MAX(CASE WHEN status = 'success' THEN created_at END)      AS last_success_at,
+        MIN(duration_ms)                                           AS min_duration_ms,
+        MAX(duration_ms)                                           AS max_duration_ms,
+        AVG(duration_ms)                                           AS avg_duration_ms
+        FROM forward_logs WHERE created_at >= @since
+    `),
+    lastForwardError: db.prepare(`
+      SELECT error, created_at FROM forward_logs WHERE status = 'failed' ORDER BY id DESC LIMIT 1
+    `),
+    pruneForwardLogs: db.prepare(`
+      DELETE FROM forward_logs WHERE id <= (
+        SELECT id FROM forward_logs ORDER BY id DESC LIMIT 1 OFFSET @maxRows
+      )
+    `),
   };
 }
 
@@ -497,11 +612,20 @@ function listDevices({ search = '', limit = 500, offset = 0, sparkline = false, 
     series = getRecentSeries({ points: sparklinePoints });
   }
 
-  const devices = rows.map((device) => ({
-    ...device,
-    metrics: byDevice.get(device.device_id) || {},
-    ...(series ? { sparkline: series.get(device.device_id) || {} } : {}),
-  }));
+  // Custom config summary — rendered as tags on the device cards.
+  const configs = allDeviceConfigs();
+
+  const devices = rows.map((device) => {
+    const saved = configs.get(device.device_id);
+    return {
+      ...device,
+      metrics: byDevice.get(device.device_id) || {},
+      config: saved ? saved.config : {},
+      config_revision: saved ? saved.revision : 0,
+      config_updated_at: saved ? saved.updated_at : null,
+      ...(series ? { sparkline: series.get(device.device_id) || {} } : {}),
+    };
+  });
 
   return { devices, total, limit: safeLimit, offset: safeOffset };
 }
@@ -840,6 +964,169 @@ function listRuleEvents(limit = 25) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Device configuration (dashboard <-> ESP/Arduino)                            */
+/* -------------------------------------------------------------------------- */
+
+function parseConfigJson(text) {
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Configuration for one device.
+ *
+ * @param {string} deviceId
+ * @param {{ withDefaults?: boolean }} [opts] `true` merges DEFAULT_DEVICE_CONFIG
+ *   so a device that has never been configured still gets a usable payload.
+ */
+function getDeviceConfig(deviceId, { withDefaults = true } = {}) {
+  const id = String(deviceId || '').trim();
+  const row = stmts.getConfig.get(id);
+  const saved = row ? parseConfigJson(row.config) : {};
+  return {
+    device_id: id,
+    config: withDefaults ? { ...DEFAULT_DEVICE_CONFIG, ...saved } : saved,
+    saved,
+    has_custom: Object.keys(saved).length > 0,
+    revision: row ? row.revision : 0,
+    updated_at: row ? row.updated_at : null,
+    updated_by: row ? row.updated_by : null,
+  };
+}
+
+/**
+ * Persist a device configuration. Values must be JSON-serialisable primitives
+ * (or small nested structures) so a microcontroller can consume them directly.
+ *
+ * @param {string} deviceId
+ * @param {object} incoming
+ * @param {{ updatedBy?: string, merge?: boolean }} [opts]
+ */
+function saveDeviceConfig(deviceId, incoming, { updatedBy = 'dashboard', merge = false } = {}) {
+  const id = String(deviceId || '').trim();
+  if (!id) throw new Error('device_id is required');
+  if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
+    throw new Error('config must be a JSON object');
+  }
+
+  const keys = Object.keys(incoming);
+  if (keys.length > 100) throw new Error('config has too many keys (max 100)');
+
+  const next = merge ? { ...getDeviceConfig(id, { withDefaults: false }).saved, ...incoming } : { ...incoming };
+  const json = JSON.stringify(next);
+  if (json.length > 16384) throw new Error('config is too large (max 16 KB)');
+
+  const ts = now();
+  stmts.upsertConfig.run({
+    device_id: id,
+    config: json,
+    updated_by: String(updatedBy).slice(0, 64),
+    ts,
+  });
+
+  const result = getDeviceConfig(id);
+  log('info', 'CONFIG', `device config saved for ${id} (${keys.length} key(s), revision ${result.revision})`);
+  bus.emit('config:changed', result);
+  return result;
+}
+
+function deleteDeviceConfig(deviceId) {
+  const { changes } = stmts.deleteConfig.run(String(deviceId || '').trim());
+  if (changes) log('warn', 'CONFIG', `device config removed for ${deviceId}`);
+  return changes > 0;
+}
+
+/** Saved configs for every device: `device_id -> {…}`. */
+function allDeviceConfigs() {
+  const map = new Map();
+  for (const row of stmts.listConfigs.all()) {
+    map.set(row.device_id, {
+      config: parseConfigJson(row.config),
+      revision: row.revision,
+      updated_at: row.updated_at,
+    });
+  }
+  return map;
+}
+
+/* -------------------------------------------------------------------------- */
+/* System settings                                                            */
+/* -------------------------------------------------------------------------- */
+
+function getSetting(key, fallback = null) {
+  const row = stmts.getSetting.get(String(key));
+  if (!row || row.value === null || row.value === '') return fallback;
+  return row.value;
+}
+
+function setSetting(key, value) {
+  const name = String(key || '').trim();
+  if (!name) throw new Error('setting key is required');
+  const text = value === null || value === undefined ? null : String(value).slice(0, 2048);
+  stmts.upsertSetting.run({ key: name, value: text, ts: now() });
+  bus.emit('settings:changed', allSettings());
+  return text;
+}
+
+function deleteSetting(key) {
+  const { changes } = stmts.deleteSetting.run(String(key));
+  if (changes) bus.emit('settings:changed', allSettings());
+  return changes > 0;
+}
+
+function allSettings() {
+  const out = {};
+  for (const row of stmts.listSettings.all()) out[row.key] = row.value;
+  return out;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Upstream forwarding audit                                                  */
+/* -------------------------------------------------------------------------- */
+
+function recordForwardLog(entry = {}) {
+  const info = stmts.insertForwardLog.run({
+    device_id: entry.device_id ? String(entry.device_id) : null,
+    url: String(entry.url || '').slice(0, 512),
+    status: ['success', 'failed', 'dropped'].includes(entry.status) ? entry.status : 'failed',
+    http_status: Number.isFinite(Number(entry.http_status)) ? Number(entry.http_status) : null,
+    attempt: Number.isFinite(Number(entry.attempt)) ? Number(entry.attempt) : 1,
+    duration_ms: Number.isFinite(Number(entry.duration_ms)) ? Number(entry.duration_ms) : null,
+    payload: entry.payload ? String(entry.payload).slice(0, 4096) : null,
+    error: entry.error ? String(entry.error).slice(0, 512) : null,
+    created_at: Number(entry.created_at) || now(),
+  });
+  return info.lastInsertRowid;
+}
+
+function listForwardLogs({ limit = 50, device_id } = {}) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 500);
+  return device_id
+    ? stmts.listForwardLogsForDevice.all(String(device_id), safeLimit)
+    : stmts.listForwardLogs.all(safeLimit);
+}
+
+function forwardStats({ sinceMs = 60 * 60 * 1000 } = {}) {
+  const row = stmts.forwardStats.get({ since: now() - Math.max(Number(sinceMs) || 0, 1000) }) || {};
+  const lastError = stmts.lastForwardError.get();
+  return {
+    total: row.total || 0,
+    success: row.success || 0,
+    failed: row.failed || 0,
+    dropped: row.dropped || 0,
+    last_success_at: row.last_success_at || null,
+    avg_duration_ms: row.avg_duration_ms === null || row.avg_duration_ms === undefined ? null : Math.round(row.avg_duration_ms),
+    max_duration_ms: row.max_duration_ms ?? null,
+    last_error: lastError ? lastError.error : null,
+    last_error_at: lastError ? lastError.created_at : null,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
 /* Stats + maintenance                                                        */
 /* -------------------------------------------------------------------------- */
 
@@ -882,6 +1169,9 @@ function prune() {
   }
   if (config.retention.maxRuleEvents > 0) {
     stmts.pruneRuleEvents.run({ maxRows: config.retention.maxRuleEvents });
+  }
+  if (config.retention.maxForwardLogs > 0) {
+    stmts.pruneForwardLogs.run({ maxRows: config.retention.maxForwardLogs });
   }
   return removed;
 }
@@ -947,6 +1237,19 @@ function seedDevices(count = config.seed.deviceCount) {
       });
       // Newly seeded devices start offline until they report in.
       db.prepare(`UPDATE devices SET status = 'offline', last_seen = NULL WHERE device_id = ?`).run(id);
+
+      // Demo custom config so the device-card config tags have something to show
+      // and `GET /api/device/:id/config` returns a realistic payload.
+      stmts.upsertConfig.run({
+        device_id: id,
+        config: JSON.stringify({
+          sample_rate_ms: [1000, 2000, 5000, 10000][(i - 1) % 4],
+          temp_threshold: 28 + (i % 6),
+          relay_pin: 2 + (i % 4),
+        }),
+        updated_by: 'seed',
+        ts: now(),
+      });
       created += 1;
     }
     return created;
@@ -1010,6 +1313,19 @@ module.exports = {
   markRuleTriggered,
   recordRuleEvent,
   listRuleEvents,
+  getDeviceConfig,
+  saveDeviceConfig,
+  deleteDeviceConfig,
+  allDeviceConfigs,
+  getSetting,
+  setSetting,
+  deleteSetting,
+  allSettings,
+  recordForwardLog,
+  listForwardLogs,
+  forwardStats,
+  DEFAULT_DEVICE_CONFIG,
+  SETTING_KEYS,
   stats,
   prune,
   seedDevices,
