@@ -42,7 +42,7 @@ automation engine.
                └─ WebSocket (Socket.io) ─▶ live telemetry, commands, config, log stream
 
        node-server ── POST (async, retried) ──▶ MAIN_WEBSITE_WEBHOOK_URL
-                     every accepted telemetry batch is mirrored upstream (§6.4)
+                     every accepted telemetry batch is mirrored upstream (§6.6)
 ```
 
 ### Components
@@ -56,7 +56,7 @@ automation engine.
 | Message broker | Eclipse Mosquitto 2 | MQTT 3.1.1/5.0 on 1883, WebSockets on 9001 |
 | MQTT client | `mqtt` 5 | auto-reconnect, degrade-gracefully design |
 | Front-end | Tailwind CSS 4 (compiled) + Chart.js 4 + vanilla JS | no CDN, no runtime build step |
-| Upstream sync | `fetch` + in-process queue (`src/forwarder.js`) | mirrors every telemetry batch to the main website, off the ingest path (§6.4) |
+| Upstream sync | `fetch` + in-process queue (`src/forwarder.js`) | mirrors every telemetry batch to the main website, off the ingest path (§6.6) |
 | Container | Docker + Docker Compose | two services, one bridge network |
 
 ### Internal event flow (why modules stay decoupled)
@@ -135,7 +135,7 @@ rule takes exactly the same path — one place to debug, one place to log.
 | Raised container | `#141C22` | `bg-panel2` | nested cards, buttons |
 | Borders | `#1E2A34` | `border-edge` | every hairline |
 | Accent / text | `#39FF14` | `text-neon` | titles, values, buttons, chart line |
-| Terminal box | `#05080A` | `.terminal` | bottom live console |
+| Terminal box | `#05080A` | `.terminal` | log panels: device console (§3.2) and system log (§3.3) |
 | Warning | `#FFB020` | `--color-warn` | stale device, broker offline |
 | Danger | `#FF3B30` | `--color-danger` | errors, failed commands |
 | Info / MQTT | `#22D3EE` | `--color-cyan` | sources in the terminal |
@@ -252,15 +252,19 @@ surface with neon accents, scoped to exactly one device. One DOM tree is reused 
 every node (no per-card markup); it is populated from `GET /api/devices/:id` and
 then kept live by the socket stream.
 
-**Header.** Device name + id, IP, MAC, location, firmware, the ONLINE/OFFLINE
-badge, six quick actions (`RELAY ON`, `RELAY OFF`, `RESTART`, `STATUS`, `PING`,
-`CONFIG_SYNC`) and the `✕` close button. `Esc` closes it too.
+**Header.** Device name (title), then `device_id · IP · MAC · location` (subtitle),
+the ONLINE/OFFLINE badge, `✕ CLOSE` — and `Esc` closes it too.
+
+Inside the `TELEMETRY` tab a four-block stat strip carries **Last ping**,
+**Location**, **Firmware** and **Config revision**, and the `COMMANDS` tab has the
+seven quick-command chips: `RELAY_ON`, `RELAY_OFF`, `STATUS`, `CALIBRATE`,
+`REBOOT`, `OTA_UPDATE`, `CONFIG_SYNC`.
 
 **Four tabs** (`data-modal-tab`, one panel visible at a time):
 
 | Tab | Contents |
 | --- | --- |
-| `TELEMETRY` | Chart.js line graph for **this device only** — sensor picker, `1m / 5m / 15m / 1h` window, `● LIVE` pause, min/max/avg/sample readout. History is backfilled over `request:history`; new points arrive on `telemetry_update` while the tab is live. |
+| `TELEMETRY` | Chart.js line graph for **this device only** — sensor picker, `5m / 15m / 1h / 6h / 24h` window (default 15m), `● LIVE` pause, min/max/avg/sample readout. History is backfilled over `request:history`; new points arrive on `telemetry_update` while the tab is live. |
 | `COMMANDS` | Payload mode `TEXT` / `JSON` with validation, glowing send button, and the 20 most recent commands for this device with status pills. |
 | `CONFIG` | The custom device configuration editor (§3.4). |
 | `LOGS` | Live console for this device only — `#dm-terminal`, `#05080A`, monospace, blinking cursor, `PAUSE` / `CLEAR`, line counter. Backfilled from REST history, then streamed live. |
@@ -290,7 +294,7 @@ Four tabs:
 
 | Tab | Contents |
 | --- | --- |
-| `FORWARDING` | Upstream webhook URL + enable toggle, `TEST`, `SAVE`, live queue / delivered / failed counters and the recent `forward_logs` table — see §6.4. Saving calls `PATCH /api/settings` and broadcasts `settings_changed`. |
+| `FORWARDING` | Upstream webhook URL + enable toggle, `TEST`, `SAVE`, live queue / delivered / failed counters and the recent `forward_logs` table — see §6.6. Saving calls `PATCH /api/settings` and broadcasts `settings_changed`. |
 | `AUTOMATION` | Rule list with neon toggles, delete buttons, trigger counts, the "new rule" form and the recent-trigger feed. |
 | `QUEUE` | The last 50 commands with status pills (`pending` / `delivered` / `acked` / `failed`). |
 | `SYSLOG` | The global terminal — deep-black `#05080A`, blinking cursor, `FOCUS` (webhooks, commands and rules only), `PAUSE`, `CLEAR`, 400-line window. |
@@ -313,7 +317,7 @@ upserts the row, emits `device_config` so every open dashboard updates, and — 
 settings over MQTT or HTTP polling. `GET /api/device/:id/config` is the read side; a
 device that has never saved anything gets the firmware defaults with
 `has_custom: false` rather than a 404, which is exactly what the boot sequence in
-§6.5 relies on. A realistic starting set:
+§6.7 relies on. A realistic starting set:
 
 ```json
 {
@@ -487,7 +491,7 @@ All responses are JSON. Errors look like `{"ok": false, "error": "..."}`.
 Rate limit: `RATE_LIMIT_MAX_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS` per IP
 (default 600/min), reported through `X-RateLimit-*` headers.
 
-### Device → server (public webhooks)
+### 6.1 Device → server (public webhooks)
 
 | Method | Path | Body / query | Purpose |
 | --- | --- | --- | --- |
@@ -495,9 +499,9 @@ Rate limit: `RATE_LIMIT_MAX_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS` per IP
 | `POST` | `/api/webhook/command` | `{device_id, command}` or `{device_id, payload}` (plain text also accepted) | queue a command and publish it to MQTT |
 | `GET` | `/api/webhook/command/poll` | `?device_id=ESP32-0001&limit=20` | HTTP-polling devices collect pending commands (marks them `delivered`, refreshes liveness) |
 | `POST` | `/api/webhook/command/ack` | `{command_id, status:"acked"\|"failed", error?}` | device confirms execution |
-| `GET` | `/api/device/:deviceId/config` | — | **boot-time config pull** for the firmware: the saved JSON plus defaults, `revision` and `has_custom` (§6.5) |
+| `GET` | `/api/device/:deviceId/config` | — | **boot-time config pull** for the firmware: the saved JSON plus defaults, `revision` and `has_custom` (§6.7). The plural alias `/api/devices/:deviceId/config` behaves identically |
 
-### Dashboard / integration API
+### 6.2 Dashboard / integration API
 
 | Method | Path | Notes |
 | --- | --- | --- |
@@ -516,7 +520,7 @@ Rate limit: `RATE_LIMIT_MAX_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS` per IP
 | `POST` | `/api/rules/:id/toggle` | `{enabled: true\|false}` (or omit to invert) |
 | `DELETE` | `/api/rules/:id` | remove a rule |
 | `GET` | `/api/rule-events` | `?limit=25` — automation audit trail |
-| `GET` | `/api/device/:deviceId/config` | saved config + defaults for one device (`has_custom`, `revision`, `updated_at`) |
+| `GET` | `/api/device/:deviceId/config` | saved config + defaults for one device (`has_custom`, `revision`, `updated_at`). Also mounted as `/api/devices/:deviceId/config` |
 | `POST` | `/api/device/:deviceId/config` | `{config, sync?, updated_by?}` — save a revision; `sync:true` also queues `CONFIG_SYNC`. Broadcasts `device_config` |
 | `DELETE` | `/api/device/:deviceId/config` | drop the saved config, reverting the node to firmware defaults |
 | `GET` | `/api/settings` | `{settings, effective, env, runtime}` — forwarding status incl. queue/delivered/failed counters |
@@ -525,7 +529,7 @@ Rate limit: `RATE_LIMIT_MAX_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS` per IP
 | `GET` | `/api/forward-logs` | `?device_id=&limit=50` — delivery audit trail + aggregate stats |
 | `POST` | `/api/forward/test` | `{url?}` — send one probe payload upstream now; `502` when the remote rejects it |
 
-### Examples
+### 6.3 Examples
 
 ```bash
 # single reading
@@ -560,7 +564,7 @@ curl -X POST http://localhost:3000/api/rules \
   -d '{"name":"If temp > 30 trigger RELAY_OFF","sensor_name":"temperature","operator":">","threshold":30,"action":"RELAY_OFF","device_id":"*","cooldown_seconds":60}'
 ```
 
-### Accepted ingest payload shapes
+### 6.4 Accepted ingest payload shapes
 
 The ingest pipeline normalises whatever a firmware can realistically send:
 
@@ -579,7 +583,7 @@ NAT address and would overwrite good data. Non-numeric values (`"OPEN"`, `"n/a"`
 stored in `raw_value` for audit but are not charted and cannot trigger rules.
 Sensor names are normalised: lower-cased, spaces/odd characters → `_`, max 64 chars.
 
-### Command payloads reaching a device
+### 6.5 Command payloads reaching a device
 
 Manual commands are delivered verbatim, exactly as the operator typed them.
 Automation commands are structured:
@@ -595,7 +599,7 @@ Automation commands are structured:
 }
 ```
 
-### 6.4 Upstream forwarding to the main website
+### 6.6 Upstream forwarding to the main website
 
 Every accepted telemetry batch — MQTT or `POST /api/webhook/data` — is mirrored to
 `MAIN_WEBSITE_WEBHOOK_URL` so the main website keeps its own copy of the fleet.
@@ -622,7 +626,7 @@ effect (`effective.source` = `database` | `env` | `unset`).
   "event": "telemetry",
   "transport": "mqtt",
   "received_at": 1789195778000,
-  "device": { "device_id": "ESP32-0001", "name": "Sensor Node 1", "ip": "10.1.1.10", "mac": "A4:CF:12:00:01", "location": "Greenhouse", "firmware": "1.4.2", "status": "online" },
+  "device": { "device_id": "ESP32-0001", "name": "Tank Node 1", "ip": "10.1.1.10", "mac": "A4:CF:12:00:01", "location": "Greenhouse", "firmware": "1.4.2", "status": "online" },
   "sensors": { "temperature": 31.4, "humidity": 48 },
   "readings": [ { "sensor_name": "temperature", "value": 31.4, "unit": "C", "created_at": 1789195778000 } ],
   "raw": { "device_id": "ESP32-0001", "sensors": { "temperature": 31.4 } }
@@ -663,7 +667,7 @@ app.post('/api/iot', (req, res) => {
 });
 ```
 
-### 6.5 ESP / Arduino boot-time configuration
+### 6.7 ESP / Arduino boot-time configuration
 
 A device can configure itself from the server on every boot, so re-provisioning a
 node never means re-flashing it:
@@ -698,12 +702,24 @@ Notes for firmware authors:
   re-fetch when the number changes. `updated_at` is epoch ms.
 - When the dashboard saves with **NOTIFY DEVICE** ticked, the server also queues a
   `CONFIG_SYNC` command (`POST /api/webhook/command` path, so MQTT *and* HTTP
-  polling both work) — a running device can re-read its settings without a reboot.
+  polling both work) — a running device can pick up its settings without a reboot.
+  That command payload already carries the new values, so firmware may apply it
+  inline…
+  ```json
+  { "action": "CONFIG_SYNC", "revision": 4, "config": { "sample_rate_ms": 2000, "temp_threshold": 33 }, "issued_at": 1789207170199 }
+  ```
+  …or simply re-fetch `GET /api/device/<id>/config`, which is what both sketches in
+  §9.2 and §9.3 do (one extra HTTP round-trip, and it guarantees defaults are merged
+  in and the `revision` is not stale).
 - A sensible set of keys (`sample_rate_ms`, `temp_threshold`, `relay_pin`,
   `mqtt_interval_ms`) is returned as defaults, so a first-boot parse always finds
   something to fall back on. Extra keys are preserved verbatim.
 - `DELETE /api/device/:id/config` wipes the saved row and returns the node to
   defaults — handy when a bad config bricks a test rig.
+
+Both complete firmware sketches in §9.2 (MQTT + HTTP fallback) and §9.3 (HTTP
+polling) implement this call, including live re-read on `CONFIG_SYNC`, so start
+from those rather than writing the bootstrap from scratch.
 
 ---
 
@@ -739,7 +755,7 @@ channel — the grid never polls REST.
 ```json
 {
   "device_id": "ESP32-0006",
-  "name": "Sensor Node 6",
+  "name": "Tank Node 6",
   "ip": "10.1.6.10",
   "mac": "A4:CF:12:00:00:06",
   "location": "Greenhouse",
@@ -756,13 +772,14 @@ channel — the grid never polls REST.
 }
 ```
 
-`config` / `config_revision` / `config_updated_at` are what the card's
-`CUSTOM CONFIG rev 3` tag summary renders; a device with nothing saved has `{}` and
-revision `0` (the card shows `no custom config`). Note that `sparkline` is a
-separate field on the same object (last 10 points per sensor, built by the
-`bootstrap` snapshot). The cards no longer draw sparklines (§3.1) — it is still
-served because `bootstrap` also feeds the inspector's chart history, and because
-`GET /api/devices?sparkline=true` remains available to other clients.
+`config` / `config_revision` / `config_updated_at` drive the inspector's CONFIG
+tab (`revision N`, `saved · …`); a device with nothing saved has `{}` and revision
+`0`. They are no longer rendered on the card itself (§3.1).
+
+`sparkline` is a separate field on the same object (last 10 points per sensor,
+built by the `bootstrap` snapshot). Cards no longer draw sparklines, but it is
+still served because `bootstrap` also feeds the inspector's chart history and
+because `GET /api/devices?sparkline=true` is useful to other clients.
 
 `telemetry_update` — one frame per sensor reading (also emitted for MQTT ingest).
 `source` is added to the socket copy only (it is not a column) so the device
@@ -777,7 +794,7 @@ inspector can label the line `HOOK` or `MQTT`:
 state flips (so a 220-node fleet does not flood the socket):
 
 ```json
-{ "device_id": "ESP32-0006", "name": "Sensor Node 6", "ip": "10.1.6.10", "mac": "A4:CF:12:00:00:06",
+{ "device_id": "ESP32-0006", "name": "Tank Node 6", "ip": "10.1.6.10", "mac": "A4:CF:12:00:00:06",
   "location": "Greenhouse", "firmware": "v1.3.0", "status": "online", "last_seen": 1789196568081,
   "last_payload": "{\"sensor\":\"temperature\",\"value\":24.63,\"unit\":\"°C\"}",
   "first_seen": 1789196000000, "updated_at": 1789196568081 }
@@ -804,9 +821,9 @@ state flips (so a 220-node fleet does not flood the socket):
 
 | Event | Where it lands |
 | --- | --- |
-| `telemetry_update` | card: headline reading (`[data-role="reading"]`), secondary readings, `Updated …` label, heartbeat badge, then the card flash — **and** if that device is open, the inspector chart point plus a line in its console |
-| `device_status` / `device_update` | card: status dot + badge, IP/MAC/firmware, config tags, reorder/insertion (throttled grid reconciliation, ≤1 re-render / 500 ms) |
-| `device_config` | card config tags + `rev N`; the open inspector's CONFIG tab (unless it holds an unsaved draft, §3.2) |
+| `telemetry_update` | card: headline reading (`[data-role="reading"]`), its sensor label + unit, `Updated …` label, heartbeat badge, then the card flash — **and** if that device is open, the inspector chart point plus a line in its console |
+| `device_status` / `device_update` | card: status dot + badge + IP, reorder/insertion (throttled grid reconciliation, ≤1 re-render / 500 ms); the open inspector's header refreshes too |
+| `device_config` | the open inspector's CONFIG tab and `rev N` chip (unless it holds an unsaved draft, §3.2) |
 | `forward_log` | FORWARDING tab table + counters; a `FWD` line in the device console when it belongs to the open device; other dashboards' cards are untouched |
 | `command_sent` / `…delivered` / `…acked` | inspector command history, the QUEUE tab table, and a `CMD` line in the open device's console |
 | `rule_triggered` | toast, recent-trigger list, `trigger_count`, and the queued command |
@@ -830,7 +847,9 @@ Rules are evaluated for every numeric reading (`src/automation.js`):
   and logged (`burst limit reached`). Raise `MAX_BURST` in `src/automation.js`
   for a large fleet with aggressive rules.
 
-Default rules created on an empty database:
+These four rules are the **only** thing written to a fresh database — no devices,
+no telemetry (§4.1). They are created by `db.seedDefaultRules()` when the rules
+table is empty, and skipped entirely with `SEED_DEFAULT_RULES=false`:
 
 | Rule | Condition | Action |
 | --- | --- | --- |
@@ -838,6 +857,9 @@ Default rules created on an empty database:
 | Heat when cold | `temperature < 16` | `RELAY_ON` |
 | Ventilate on CO2 spike | `co2 > 1000` | `FAN_ON` |
 | Low battery warning | `battery < 20` | `SEND_ALERT` (`battery_low`) |
+
+Because the fleet is empty on first boot, none of them can fire until a device
+reports a matching sensor — they sit in the Automation tab waiting.
 
 ---
 
@@ -890,8 +912,12 @@ const int   MQTT_PORT   = 1883;
 const char* API_BASE    = "http://192.168.1.50:3000";
 const char* DEVICE_ID   = "ESP32-0001";     // must be unique per board
 const char* LOCATION    = "Plant A";
-const int   RELAY_PIN   = 2;                // onboard LED is fine for testing
-const unsigned long SEND_INTERVAL_MS = 5000;
+
+// Firmware defaults — overwritten by GET /api/device/<id>/config at boot.
+int           relayPin       = 2;          // onboard LED is fine for testing
+unsigned long sendIntervalMs = 5000;
+float         tempThreshold  = 30.0;
+long          configRevision = 0;
 
 WiFiClient   net;
 PubSubClient mqtt(net);
@@ -922,13 +948,36 @@ void onCommand(char* topic, byte* payload, unsigned int length) {
     serializeJson(doc, raw);
   }
 
-  if (action != nullptr && strcmp(action, "RELAY_ON") == 0)       digitalWrite(RELAY_PIN, HIGH);
-  else if (action != nullptr && strcmp(action, "RELAY_OFF") == 0) digitalWrite(RELAY_PIN, LOW);
+  if (action != nullptr && strcmp(action, "RELAY_ON") == 0)       digitalWrite(relayPin, HIGH);
+  else if (action != nullptr && strcmp(action, "RELAY_OFF") == 0) digitalWrite(relayPin, LOW);
   else if (action != nullptr && strcmp(action, "STATUS") == 0) { /* report immediately */ }
-  else if (raw.indexOf("RELAY_ON") >= 0)  digitalWrite(RELAY_PIN, HIGH);
-  else if (raw.indexOf("RELAY_OFF") >= 0) digitalWrite(RELAY_PIN, LOW);
+  else if (action != nullptr && strcmp(action, "CONFIG_SYNC") == 0) loadConfig();
+  else if (raw.indexOf("RELAY_ON") >= 0)  digitalWrite(relayPin, HIGH);
+  else if (raw.indexOf("RELAY_OFF") >= 0) digitalWrite(relayPin, LOW);
 
   if (commandId > 0) publishAck(commandId, "acked");
+}
+
+// Boot-time provisioning: pull this device's saved configuration (§6.7). The
+// endpoint merges firmware defaults in and never 404s, so a factory-fresh board
+// is safe to call it before it has ever reported. `SAVE & SYNC TO ESP` in the
+// dashboard queues CONFIG_SYNC, which calls this again without a reboot.
+void loadConfig() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(String(API_BASE) + "/api/device/" + DEVICE_ID + "/config");
+  if (http.GET() == 200) {
+    StaticJsonDocument<512> doc;
+    if (!deserializeJson(doc, http.getString())) {
+      sendIntervalMs = doc["config"]["sample_rate_ms"] | sendIntervalMs;
+      tempThreshold  = doc["config"]["temp_threshold"] | tempThreshold;
+      relayPin       = doc["config"]["relay_pin"]      | relayPin;
+      configRevision = doc["revision"] | 0;
+      Serial.printf("config rev %ld: %lu ms, threshold %.1f C, pin %d\n",
+                    configRevision, sendIntervalMs, tempThreshold, relayPin);
+    }
+  }
+  http.end();
 }
 
 void connectWifi() {
@@ -967,14 +1016,15 @@ void sendOverHttp(float t, float h) {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW);
 
   snprintf(topicTelemetry, sizeof(topicTelemetry), "iot/%s/telemetry", DEVICE_ID);
   snprintf(topicCommand,   sizeof(topicCommand),   "iot/%s/command",   DEVICE_ID);
   snprintf(topicAck,       sizeof(topicAck),       "iot/%s/ack",       DEVICE_ID);
 
   connectWifi();
+  loadConfig();                 // provisioning before the first reading
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(onCommand);
   connectMqtt();
@@ -985,10 +1035,15 @@ void loop() {
   if (!mqtt.connected()) connectMqtt();
   mqtt.loop();
 
-  if (millis() - lastSend >= SEND_INTERVAL_MS) {
+  if (millis() - lastSend >= sendIntervalMs) {
     lastSend = millis();
     float temperature = 20.0 + random(0, 1500) / 100.0;   // replace with real sensor
     float humidity    = 40.0 + random(0, 3000) / 100.0;
+
+    // Local safety net using the threshold from the config above. The server's
+    // automation rules also act on this reading — belt and braces, so the node
+    // still protects itself if the link drops.
+    digitalWrite(relayPin, temperature > tempThreshold ? LOW : HIGH);
 
     StaticJsonDocument<256> doc;
     doc["sensors"]["temperature"] = serialized(String(temperature, 2));
@@ -1008,6 +1063,10 @@ void loop() {
 
 ### 9.3 Firmware B — HTTP polling only (ESP8266, no broker access)
 
+Useful when the board cannot reach the broker at all: it posts readings and polls
+for commands over HTTP. It also provisions itself from
+`GET /api/device/<id>/config` at boot.
+
 ```cpp
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
@@ -1018,7 +1077,28 @@ const char* WIFI_PASS = "YOUR_PASSWORD";
 const char* API_BASE  = "http://192.168.1.50:3000";
 const char* DEVICE_ID = "ESP8266-01";
 
+// Firmware defaults — overwritten by loadConfig().
+float         tempThreshold = 30.0;
+unsigned long sampleMs      = 5000;
+
 unsigned long lastSend = 0, lastPoll = 0;
+
+// Pull this node's saved settings. The endpoint merges defaults in and never
+// 404s, so a brand-new board can call it before it has ever reported (§6.7).
+void loadConfig() {
+  HTTPClient http;
+  http.begin(String(API_BASE) + "/api/device/" + DEVICE_ID + "/config");
+  if (http.GET() == 200) {
+    StaticJsonDocument<512> doc;
+    if (!deserializeJson(doc, http.getString())) {
+      tempThreshold = doc["config"]["temp_threshold"] | tempThreshold;
+      sampleMs      = doc["config"]["sample_rate_ms"]  | sampleMs;
+      Serial.printf("config rev %d: %lu ms interval, threshold %.1f C\n",
+                    doc["revision"].as<int>(), sampleMs, tempThreshold);
+    }
+  }
+  http.end();
+}
 
 void postReading(const char* sensor, float value, const char* unit) {
   HTTPClient http;
@@ -1045,8 +1125,9 @@ void pollCommands() {
   for (JsonObject cmd : doc["commands"].as<JsonArray>()) {
     const long id = cmd["id"];
     String payload = cmd["payload"].as<String>();
-    if (payload.indexOf("RELAY_ON")  >= 0) digitalWrite(LED_BUILTIN, LOW);
-    if (payload.indexOf("RELAY_OFF") >= 0) digitalWrite(LED_BUILTIN, HIGH);
+    if (payload.indexOf("RELAY_ON")     >= 0) digitalWrite(LED_BUILTIN, LOW);
+    if (payload.indexOf("RELAY_OFF")    >= 0) digitalWrite(LED_BUILTIN, HIGH);
+    if (payload.indexOf("CONFIG_SYNC")  >= 0) loadConfig();   // re-read settings live
 
     HTTPClient ack;                       // acknowledge execution
     ack.begin(String(API_BASE) + "/api/webhook/command/ack");
@@ -1063,10 +1144,11 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   while (WiFi.status() != WL_CONNECTED) delay(400);
   Serial.println(WiFi.localIP());
+  loadConfig();                       // provisioning before the first reading
 }
 
 void loop() {
-  if (millis() - lastSend > 5000) { lastSend = millis(); postReading("temperature", 22.0 + random(0, 900) / 100.0, "C"); }
+  if (millis() - lastSend > sampleMs) { lastSend = millis(); postReading("temperature", 22.0 + random(0, 900) / 100.0, "C"); }
   if (millis() - lastPoll > 3000) { lastPoll = millis(); pollCommands(); }
   delay(10);
 }
@@ -1182,6 +1264,7 @@ values through `environment:` in `docker-compose.yml`.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `NODE_ENV` | `development` | reported by `/api/health`; `production` also silences the per-forward success log (1 in 50 still prints) |
 | `PORT` / `HOST` | `3000` / `0.0.0.0` | HTTP + Socket.io bind |
 | `DB_PATH` | `./data/iot.db` | SQLite file (created with parent dirs) |
 | `MQTT_URL` | `mqtt://localhost:1883` | broker URL (**`mqtt://mqtt-broker:1883` inside compose**) |
@@ -1196,7 +1279,7 @@ values through `environment:` in `docker-compose.yml`.
 | `TELEMETRY_MAX_ROWS` | `2000000` | hard row cap, oldest trimmed first |
 | `SEED_DEFAULT_RULES` | `true` | create the 4 baseline automation rules on an empty rules table. A fresh DB has **0 devices** either way — there is no device seeder |
 | `RATE_LIMIT_WINDOW_SECONDS` / `RATE_LIMIT_MAX_REQUESTS` | `60` / `600` | per-IP throttle on `/api` |
-| `MAIN_WEBSITE_WEBHOOK_URL` | *(empty)* | upstream site that receives a copy of every telemetry batch (§6.4). Overridable at runtime from the Settings modal |
+| `MAIN_WEBSITE_WEBHOOK_URL` | *(empty)* | upstream site that receives a copy of every telemetry batch (§6.6). Overridable at runtime from the Settings modal |
 | `MAIN_WEBSITE_FORWARD_ENABLED` | `false` | master switch for forwarding (defaults to `true` when a URL is set) |
 | `FORWARD_TIMEOUT_MS` | `8000` | per-attempt upstream timeout |
 | `FORWARD_RETRIES` | `2` | retries after a retryable failure (backoff ×`FORWARD_RETRY_BACKOFF_MS`) |
@@ -1238,6 +1321,10 @@ unless the virtual node's telemetry actually reaches the server, at which point
 the device is registered by exactly the same code path as real hardware
 (`upsertDevice` via the ingest pipeline). Stop the simulator and those devices
 simply age into `OFFLINE`; run `npm run db:reset` to clear them out.
+
+Every flag has an environment equivalent — `SIM_URL`, `SIM_MQTT_URL`,
+`SIM_DEVICES`, `SIM_INTERVAL`, `SIM_CONCURRENCY`, `SIM_PREFIX`, `SIM_ANOMALY`,
+`SIM_DURATION` — handy for compose or a scheduled run.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -1282,7 +1369,7 @@ most recent "seedless + simplified + enlarged type" pass.
 | Rate limiter / 404 handler / SPA fallback (no path traversal) | ✅ |
 | Simulator: 30 devices → 240 telemetry rows, 19 automation commands, 0 failures | ✅ |
 | Migration on a pre-existing **v1** database (`user_version` 1 → 2 → 3, `devices.mac` added, three new tables created) | ✅ |
-| `mac` accepted from payloads, stored, shown on cards and searchable via `?search=` | ✅ |
+| `mac` accepted from payloads, stored, searchable via `?search=` and shown in the inspector header (it is no longer on the card) | ✅ |
 | Sparkline series: per (device, sensor), capped at 10 points, 5-minute window | ✅ |
 | Sparkline cost at scale: 39,600-row window → 44.5 ms / 384 KB for 1000 devices (0.2 ms without) | ✅ |
 | Heartbeat 30 s served by `/api/health` (`offline_after_seconds`) and applied in the browser | ✅ |
@@ -1382,7 +1469,7 @@ device is registered by a real webhook mid-run. **56/56 checks passed:**
    have bookmarked a deep link into the old layout.
 6. **`/api/device/:id/config` never 404s for an unknown device.** It returns the
    firmware defaults with `has_custom: false`, because a factory-fresh board must
-   be able to provision itself at boot (§6.5). An explicit `DELETE` is how you
+   be able to provision itself at boot (§6.7). An explicit `DELETE` is how you
    remove a saved config.
 7. **All device fixtures were deleted; a fresh database is empty** (§4.1). The
    220-device generator, its demo configs and the demo MAC scheme are gone, along
@@ -1408,7 +1495,7 @@ device is registered by a real webhook mid-run. **56/56 checks passed:**
 | --- | --- |
 | `NO IOT DEVICES REGISTERED YET` after a fresh install | expected — the database starts empty by design (§4.1). Point a device at `POST /api/webhook/data` (or `npm run simulate` for a virtual fleet) and cards appear immediately |
 | Want demo data back temporarily | `node scripts/simulator.js --devices 220` registers a virtual fleet through the real ingest path; `npm run db:reset` clears it again |
-| Old fake "Sensor Node" rows still in the dashboard | they were created by a pre-`f6cd263` build. `npm run db:reset` (server stopped) wipes and recreates the DB with 0 devices |
+| Old fake "Sensor Node" rows still in the dashboard | they were created by a build from before this revision (the seeder was removed in `51c9298`). `npm run db:reset` (server stopped) wipes and recreates the DB with 0 devices |
 | Dashboard loads unstyled | `public/css/app.css` missing → `npm run build:css` |
 | Header badge `MQTT: OFFLINE` | broker not running or wrong `MQTT_URL`. Inside compose it must be `mqtt://mqtt-broker:1883` |
 | Commands stay `pending` | broker down **and** the device is not polling. Check `/api/mqtt/status`, then `docker compose logs mqtt-broker` |
@@ -1416,7 +1503,7 @@ device is registered by a real webhook mid-run. **56/56 checks passed:**
 | `SQLITE_IOERR` / "disk I/O error" | database on exFAT/NTFS/SMB → move to ext4 or a named volume (§10.4) |
 | `EACCES` writing `/app/data` | `sudo chown -R 1000:1000 ./data` (container runs as `node`) |
 | Ports already in use | `sudo lsof -i :3000` / `docker compose down` another stack |
-| Terminal panel floods / UI sluggish | reduce ingest rate, use `FOCUS`, or raise `LOG_THROTTLE_MS` in `src/ingest.js` |
+| Terminal panel floods / UI sluggish | reduce ingest rate, use `FOCUS`, or raise the `LOG_THROTTLE_MS` constant (15 s, per device+sensor) in `src/ingest.js` — it is a code constant, not an env var |
 | Rule fires constantly | increase `cooldown_seconds`; the burst limiter caps 25 triggers / 5 s |
 | Inspector chart empty but the card shows a reading | only numeric values are charted; non-numeric payloads land in `raw_value`. Also check the sensor picker — the chart follows one series at a time |
 | Chart missing entirely | the vendored library failed to load: check `/vendor/chart.umd.js` (`npm run vendor`) and the browser console |
